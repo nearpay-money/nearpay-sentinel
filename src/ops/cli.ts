@@ -1,0 +1,173 @@
+/**
+ * Stage 1 ops CLI (platform §3, lld/sentinel.md §14): `docker compose exec sentinel-api /nodejs/bin/node
+ * dist/ops.js <command>`. Every command prints one JSON document; errors print `{"error": …}` and exit 1
+ * (2: usage). Kill-switch changes are recorded in `kill_switch_log` with the operator (`cli@<host>`) and
+ * emitted like any other change; the two-person release arrives with the Stage 2 console.
+ */
+import { parseArgs } from "node:util";
+import { sql } from "@nearpay-internal/db";
+import { fromUuid, isId, toUuid } from "@nearpay-internal/ids";
+import { ApiError } from "@nearpay-internal/service";
+import type { Sentinel } from "../app/context.js";
+import { killSwitchState, setKillSwitch } from "../kill-switch/kill-switch.js";
+
+export const USAGE = `usage: ops.js <command> [arguments]
+
+  kill-switch                               the kill switch and its last 20 changes
+  kill-switch-engage <reason…>              stop live quoting now
+  kill-switch-release <reason…>             resume live quoting (Stage 1: one operator, logged)
+  findings [--all] [--limit N]              open (unacknowledged, non-pass) audit findings; --all: every finding
+  finding-ack <fnd_…> <note…>               acknowledge a finding
+  attestations <pa_… | deposit key | deposit address> [--limit N]   co-signing records, newest first`;
+
+class UsageError extends Error {}
+
+export interface OpsDeps {
+  actor: string;
+  out?: (line: string) => void;
+  err?: (line: string) => void;
+}
+
+export async function runOps(argv: readonly string[], s: Sentinel, deps: OpsDeps): Promise<number> {
+  const out = deps.out ?? ((l: string) => process.stdout.write(`${l}\n`));
+  const err = deps.err ?? ((l: string) => process.stderr.write(`${l}\n`));
+  try {
+    const { values, positionals } = parseArgs({
+      args: [...argv],
+      allowPositionals: true,
+      strict: true,
+      options: { all: { type: "boolean" }, limit: { type: "string" } },
+    });
+    const [cmd, ...args] = positionals;
+    const result = await run(s, cmd, args, { all: values.all ?? false, limit: values.limit }, deps.actor);
+    out(JSON.stringify(result, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
+    return 0;
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    if (
+      e instanceof UsageError ||
+      code === "ERR_PARSE_ARGS_UNKNOWN_OPTION" ||
+      code === "ERR_PARSE_ARGS_INVALID_OPTION_VALUE"
+    ) {
+      err(`${e instanceof Error ? e.message : String(e)}\n\n${USAGE}`);
+      return 2;
+    }
+    err(JSON.stringify({ error: e instanceof ApiError ? { code: e.code, message: e.message } : String(e) }));
+    return 1;
+  }
+}
+
+function reasonOf(args: readonly string[]): string {
+  const reason = args.join(" ").trim();
+  if (!reason) throw new UsageError("a reason is required");
+  if (reason.length > 500) throw new UsageError("the reason is limited to 500 characters");
+  return reason;
+}
+
+function limitOf(v: string | undefined): number {
+  if (v === undefined) return 50;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 1000) throw new UsageError("--limit must be an integer from 1 to 1000");
+  return n;
+}
+
+const findingView = (f: {
+  id: string;
+  execution_id: string;
+  account_id: string;
+  livemode: boolean;
+  check_kind: string;
+  result: string;
+  details: unknown;
+  created_at: Date;
+  acknowledged_at: Date | null;
+  acknowledged_by: string | null;
+}) => ({
+  id: fromUuid("fnd", f.id),
+  execution_id: f.execution_id,
+  account_id: fromUuid("acct", f.account_id),
+  livemode: f.livemode,
+  check_kind: f.check_kind,
+  result: f.result,
+  details: f.details,
+  created_at: f.created_at,
+  acknowledged_at: f.acknowledged_at,
+  acknowledged_by: f.acknowledged_by,
+});
+
+async function run(
+  s: Sentinel,
+  cmd: string | undefined,
+  args: string[],
+  o: { all: boolean; limit: string | undefined },
+  actor: string,
+): Promise<unknown> {
+  switch (cmd) {
+    case "kill-switch": {
+      const [state, log] = await Promise.all([
+        killSwitchState(s),
+        s.db.selectFrom("kill_switch_log").selectAll().orderBy("created_at", "desc").limit(20).execute(),
+      ]);
+      return { ...state, log };
+    }
+    case "kill-switch-engage":
+      return setKillSwitch(s, true, reasonOf(args), actor);
+    case "kill-switch-release":
+      return setKillSwitch(s, false, reasonOf(args), actor);
+    case "findings": {
+      let q = s.db.selectFrom("audit_findings").selectAll().orderBy("created_at", "desc").limit(limitOf(o.limit));
+      if (!o.all) q = q.where("result", "<>", "pass").where("acknowledged_at", "is", null);
+      return (await q.execute()).map(findingView);
+    }
+    case "finding-ack": {
+      const [ref, ...note] = args;
+      if (!ref || !isId("fnd", ref)) throw new UsageError("finding-ack needs a fnd_… id");
+      const who = `${actor}: ${reasonOf(note)}`.slice(0, 500);
+      const row = await s.db
+        .updateTable("audit_findings")
+        .set({ acknowledged_at: new Date(), acknowledged_by: who })
+        .where("id", "=", toUuid(ref, "fnd"))
+        .where("acknowledged_at", "is", null)
+        .returningAll()
+        .executeTakeFirst();
+      if (!row) {
+        const exists = await s.db
+          .selectFrom("audit_findings")
+          .select("id")
+          .where("id", "=", toUuid(ref, "fnd"))
+          .executeTakeFirst();
+        if (!exists) throw ApiError.missing("audit_finding", ref);
+        throw new ApiError("state_conflict", { message: "The finding is already acknowledged." });
+      }
+      s.log.warn({ finding: ref, actor }, "audit finding acknowledged");
+      return findingView(row);
+    }
+    case "attestations": {
+      const ref = args[0];
+      if (!ref) throw new UsageError("attestations needs an attempt id, deposit key or deposit address");
+      let q = s.db
+        .selectFrom("attestations")
+        .select([
+          "id",
+          "livemode",
+          "kind",
+          "deposit_key",
+          "attempt_id",
+          "result",
+          "class",
+          "reasons",
+          "client_ip",
+          "expires_at",
+          "created_at",
+        ])
+        .orderBy("created_at", "desc")
+        .limit(limitOf(o.limit));
+      if (isId("pa", ref)) q = q.where("attempt_id", "=", ref);
+      else if (ref.includes("|") || ref.startsWith("np1:")) q = q.where("deposit_key", "=", ref);
+      else q = q.where(sql<string>`split_part(deposit_key, '|', 2)`, "=", ref);
+      return q.execute();
+    }
+    default:
+      throw new UsageError(cmd ? `unknown command ${cmd}` : "missing command");
+  }
+}

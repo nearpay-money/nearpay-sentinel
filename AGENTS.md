@@ -11,7 +11,9 @@ Scope: Independent second party with its own code, credentials and deploy pipeli
 
 ## Rules for this repo
 
-- Hexagonal layout: `src/domain` is pure (no I/O); `src/app` holds use cases; `src/infra` adapts DB, HTTP clients and NATS; `src/api` maps spec-generated routes to use cases.
+- Layout (LLD §3): `src/address-integrity`, `src/independent-reconciliation/audit.ts` and `src/co-signer/crypto.ts` are pure (no I/O, coverage-gated); the use cases sit next to them (`co-signer/attest.ts`, `independent-reconciliation/auditor.ts`, `kill-switch/`); `src/infra` adapts DB, HTTP clients and chains; `src/api` maps spec routes to use cases.
+- Fail closed: any doubt means no signature. Never let an input a payer, merchant or attacker controls engage the kill switch (only a live address rails confirms, after a `security` refusal).
+- Trust only the provider's signed status, identity's registry view and sentinel's own RPC reads; rails is asked only whether it issued a deposit address (and, for sampling, asset decimals) — never for a verdict.
 - Every state change writes the aggregate row, a transition row and an outbox row in ONE transaction.
 - Every public POST honours `Idempotency-Key` inside the same transaction as the side effect.
 - Every query filters by `account_id` AND `livemode` (INV-8).
