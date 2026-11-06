@@ -1,0 +1,89 @@
+/** Kysely table types (migrations/0001_sentinel.sql) and identity's registry view (read-only role). */
+import type { ColumnType, KitTables } from "@nearpay-internal/db";
+
+type Timestamp = ColumnType<Date, Date | string | undefined, Date | string>;
+type Opt<T> = ColumnType<T | null, T | null | undefined, T | null>;
+type Json<T> = ColumnType<T, string, string>;
+type OptJson<T> = ColumnType<T | null, string | null | undefined, string | null>;
+
+export interface AttestationsTable {
+  id: string;
+  livemode: boolean;
+  kind: "route_quote" | "intents_transfer";
+  deposit_key: string;
+  attempt_id: string;
+  account_id: Opt<string>;
+  destination_id: Opt<string>;
+  result: "signed" | "rejected" | "unavailable";
+  class: Opt<string>;
+  reasons: ColumnType<string[], string[] | undefined, string[]>;
+  response: OptJson<unknown>;
+  client_ip: Opt<string>;
+  expires_at: Opt<Date>;
+  created_at: Timestamp;
+}
+
+export interface AuditFindingsTable {
+  id: string;
+  execution_id: string;
+  account_id: string;
+  livemode: boolean;
+  check_kind: "destination" | "settlement";
+  result: "pass" | "mismatch" | "unverifiable";
+  details: Json<Record<string, unknown>>;
+  tx_chain: Opt<string>;
+  tx_hash: Opt<string>;
+  recipient: Opt<string>;
+  asset_id: Opt<string>;
+  /** numeric(78,0): read as a decimal string. */
+  amount: ColumnType<string | null, string | null | undefined, string | null>;
+  created_at: Timestamp;
+  acknowledged_at: Opt<Date>;
+  acknowledged_by: Opt<string>;
+}
+
+export interface KillSwitchTable {
+  id: number;
+  engaged: boolean;
+  reason: string;
+  actor: string;
+  version: number;
+  updated_at: Timestamp;
+}
+
+export interface KillSwitchLogTable {
+  id: string;
+  engaged: boolean;
+  reason: string;
+  actor: string;
+  version: number;
+  created_at: Timestamp;
+}
+
+export interface SentinelTables {
+  attestations: AttestationsTable;
+  audit_findings: AuditFindingsTable;
+  kill_switch: KillSwitchTable;
+  kill_switch_log: KillSwitchLogTable;
+}
+
+export type DB = SentinelTables & KitTables;
+
+/** identity's `sentinel_destination_registry` view (identity migrations 0001 + 0002): active destinations and once-active disabled ones. */
+export interface RegistryDB {
+  sentinel_destination_registry: {
+    id: string;
+    account_id: string;
+    livemode: boolean;
+    asset_id: string;
+    type: string;
+    chain: string;
+    address_norm: string;
+    status: string;
+    active_at: Date | null;
+    merchant_name: string;
+    kyb_verified: boolean;
+    verification: string;
+    disabled_at: Date | null;
+  };
+}

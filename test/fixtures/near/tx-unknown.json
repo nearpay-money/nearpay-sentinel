@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","error":{"name":"HANDLER_ERROR","cause":{"info":{"requested_transaction_hash":"4zHgrDmAZRiX7pTmZnwh4nKvGFstEdeCFtUuMBqsazq1"},"name":"UNKNOWN_TRANSACTION"},"code":-32000,"message":"Server error","data":"Transaction 4zHgrDmAZRiX7pTmZnwh4nKvGFstEdeCFtUuMBqsazq1 doesn't exist"},"id":"np"}
