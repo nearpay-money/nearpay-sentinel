@@ -4,10 +4,12 @@ import { describe, expect, it } from "vitest";
 import {
   attribute,
   consistencyFailures,
+  destinationSide,
   destinationVerdict,
   nearTransfers,
   normalRecipient,
   received,
+  refundFailures,
   SKEW_MS,
   settlementChain,
 } from "../../src/independent-reconciliation/audit.js";
@@ -228,5 +230,77 @@ describe("transaction keys", () => {
     expect(txKey("near:mainnet", "AXvXuteK8UUNE3nhGx3Cdmxm1ax3CiqCx2MyFkbCwpYv")).toBe(
       "AXvXuteK8UUNE3nhGx3Cdmxm1ax3CiqCx2MyFkbCwpYv",
     );
+  });
+});
+
+describe("refund legs (kind: refund)", () => {
+  const MERCHANT = "merchant.near";
+  const refund = (o: Partial<Execution> = {}) =>
+    execution({
+      kind: "refund",
+      origin: { asset_id: USDC_NEAR, chain: "near:mainnet", refund_to: MERCHANT, refund_type: "intents" },
+      settlement: { recipient: "payer.near", recipient_type: "intents", chain: "near:mainnet", asset_id: USDC_NEAR },
+      refund: {
+        swap_type: null,
+        amount: "2000017",
+        amount_out_expected: null,
+        min_amount_out: null,
+        token: null,
+        transfer: {
+          signer_id: MERCHANT,
+          receiver_id: "payer.near",
+          token: USDC_NEAR,
+          amount: "2000017",
+          memo: "np1:4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+          deadline: "2026-11-05T10:15:00.000Z",
+        },
+      },
+      ...o,
+    });
+
+  it("checks the source (the merchant's destination), not the payer's refund address", () => {
+    const { side, view } = destinationSide(refund());
+    expect(side).toBe("refund_source");
+    expect(view.settlement).toMatchObject({ recipient: MERCHANT, recipient_type: "intents", asset_id: USDC_NEAR });
+    const row = {
+      type: "intents_account",
+      chain: "near:mainnet",
+      address_norm: MERCHANT,
+      active_at: new Date(0),
+      disabled_at: null,
+    };
+    expect(destinationVerdict(view, [row]).result).toBe("pass");
+    expect(destinationVerdict(view, [{ ...row, address_norm: "other.near" }]).result).toBe("mismatch");
+    const chainSource = destinationSide(
+      refund({
+        origin: { asset_id: USDC_NEAR, chain: "eip155:8453", refund_to: "0xAbC", refund_type: "origin_chain" },
+      }),
+    );
+    expect(chainSource.view.settlement).toMatchObject({ recipient_type: "destination_chain", chain: "eip155:8453" });
+    expect(destinationSide(execution()).side).toBe("recipient");
+  });
+
+  it("a merchant-signed transfer must come from the source, in the source asset", () => {
+    expect(refundFailures(refund())).toEqual([]);
+    expect(refundFailures(execution())).toEqual([]);
+    expect(refundFailures(refund({ refund: null }))).toEqual([]);
+    const base = refund();
+    const t = base.refund?.transfer as NonNullable<NonNullable<Execution["refund"]>["transfer"]>;
+    expect(
+      refundFailures({
+        ...base,
+        refund: { ...(base.refund as object), transfer: { ...t, signer_id: "x.near" } } as Execution["refund"],
+      }),
+    ).toEqual(["refund transfer is not signed by the refund source"]);
+    expect(
+      refundFailures({
+        ...base,
+        refund: { ...(base.refund as object), transfer: { ...t, token: "nep141:wrap.near" } } as Execution["refund"],
+      }),
+    ).toEqual(["refund transfer asset is not the source asset"]);
+    expect(refundFailures({ ...base, origin: { ...base.origin, refund_type: "origin_chain" } })).toContain(
+      "refund transfer from a non-Intents source",
+    );
+    expect(consistencyFailures(refund())).toEqual([]);
   });
 });

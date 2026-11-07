@@ -7,7 +7,7 @@
  */
 import { routeQuoteDepositKey } from "@nearpay/spec";
 import { fromUuid, newId, toUuid } from "@nearpay-internal/ids";
-import { AuditFinding, type Execution, KillSwitchEvent } from "@nearpay-internal/spec";
+import { AuditFinding, type Execution, KillSwitchEvent, OpsActionEvent, OpsApproval } from "@nearpay-internal/spec";
 import { domainEvent, internalSettlementDestination } from "@nearpay-internal/testing";
 import { Redis } from "ioredis";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -27,7 +27,7 @@ import {
   PROVIDER_FEE_ACCOUNT,
 } from "../support/fakes.js";
 import { fixture } from "../support/keys.js";
-import { LIVE_TREASURY, type Stack, startStack } from "../support/stack.js";
+import { LIVE_TREASURY, OPS_CLI_OPERATOR, type Stack, startStack } from "../support/stack.js";
 
 const BASE = "eip155:8453";
 const SOL = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
@@ -370,6 +370,74 @@ describe("NEAR: Intents and NEP-141", () => {
   });
 });
 
+describe("refund legs (kind: refund): source and delivery to the payer", () => {
+  /** An Intents refund leg: merchant.near (the account's destination) → the payer's Intents account. */
+  function refundLeg(o: { source?: string; payer?: string; amount: string; hash: string }): Execution {
+    const x = settled({
+      asset: USDC_NEAR,
+      type: "intents",
+      recipient: o.payer ?? "payer.near",
+      amount: o.amount,
+      hash: o.hash,
+    });
+    return {
+      ...x,
+      kind: "refund",
+      method: "intents_transfer",
+      provider: "direct_intents",
+      deposit: null,
+      origin: {
+        asset_id: USDC_NEAR,
+        chain: "near:mainnet",
+        refund_to: o.source ?? "merchant.near",
+        refund_type: "intents",
+      },
+      refund: {
+        swap_type: null,
+        amount: o.amount,
+        amount_out_expected: null,
+        min_amount_out: null,
+        token: null,
+        transfer: {
+          signer_id: o.source ?? "merchant.near",
+          receiver_id: o.payer ?? "payer.near",
+          token: USDC_NEAR,
+          amount: o.amount,
+          memo: "np1:4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi",
+          deadline: new Date(Date.now() + 600_000).toISOString(),
+        },
+      },
+    } as Execution;
+  }
+
+  it("passes a refund from the merchant's destination that reached the payer (no false destination mismatch)", async () => {
+    const hash = "RefundHash111111111111111111111111111111111111";
+    nearTxs.set(hash, nearTx("intents.near", [mtTransfer("payer.near", USDC_NEAR, "1500000")]));
+    const x = refundLeg({ amount: "1500000", hash });
+    await auditExecution(w, x, 1);
+    expect(await results(x.id)).toEqual({ destination: "pass", settlement: "pass" });
+    const d = (await findings(x.id)).find((f) => f.check_kind === "destination");
+    expect(d?.details).toMatchObject({ side: "refund_source", source: "merchant.near" });
+  });
+
+  it("mismatch when the chain shows less reached the payer", async () => {
+    const hash = "RefundHash222222222222222222222222222222222222";
+    nearTxs.set(hash, nearTx("intents.near", [mtTransfer("payer.near", USDC_NEAR, "100")]));
+    const x = refundLeg({ amount: "1500000", hash });
+    await auditExecution(w, x, 1);
+    expect(await results(x.id)).toEqual({ destination: "pass", settlement: "mismatch" });
+  });
+
+  it("mismatch when the source is not a destination of the account", async () => {
+    const hash = "RefundHash333333333333333333333333333333333333";
+    nearTxs.set(hash, nearTx("intents.near", [mtTransfer("payer.near", USDC_NEAR, "1500000")]));
+    const x = refundLeg({ source: "stranger.near", amount: "1500000", hash });
+    await auditExecution(w, x, 1);
+    expect(await results(x.id)).toEqual({ destination: "mismatch", settlement: "pass" });
+    expect(await reasonOf(x.id, "destination")).toMatch(/^refund source:/);
+  });
+});
+
 describe("Tier B: the provider's signed status, with sentinel's own key", () => {
   const solana = "4Nd1mBQtrMJVYVfKf2PJy9NZUZdTAsp7D4xWLs4gDB4T";
   function tierB(status: string, swap: Record<string, unknown>, o: { hash?: string } = {}) {
@@ -598,11 +666,35 @@ describe("worker end to end (NATS)", () => {
     const token = await s.opsToken();
     await s.call("POST", "/internal/kill-switch", { token, body: { engaged: true, reason: "e2e" } });
     const on = await probe.next("evt.sentinel.kill_switch.engaged", () => true, 15_000);
-    expect(KillSwitchEvent.parse(on.data.object)).toEqual({ engaged: true, reason: "e2e", actor: "ops:ops-alice" });
+    expect(KillSwitchEvent.parse(on.data.object)).toEqual({
+      engaged: true,
+      reason: "e2e",
+      actor: `ops:${OPS_CLI_OPERATOR}`,
+    });
     await s.call("POST", "/internal/kill-switch", { token, body: { engaged: false, reason: "e2e over" } });
     const off = await probe.next("evt.sentinel.kill_switch.released", () => true, 15_000);
     expect(off.aggregate.version).toBe(on.aggregate.version + 1);
     expect(off.aggregate.id).toBe(on.aggregate.id);
+    await probe.close();
+  });
+
+  it("the relay publishes the console's release request and operator actions (notify, identity)", async () => {
+    const probe = await s.probe("evt.sentinel.>");
+    const op = await s.operatorToken({ sub: newId("usr"), role: "ops" });
+    await s.call("POST", "/ops/kill_switch/engage", { token: op, body: { reason: "e2e console" } });
+    const req = await s.call("POST", "/ops/kill_switch/release_requests", { token: op, body: { reason: "fixed" } });
+    expect(req.status).toBe(201);
+    const requested = await probe.next("evt.sentinel.kill_switch.release_requested", () => true, 15_000);
+    expect(OpsApproval.parse(requested.data.object)).toMatchObject({
+      id: (req.body as { id: string }).id,
+      status: "pending",
+    });
+    const action = await probe.next(
+      "evt.sentinel.ops_action.recorded",
+      (e) => (e.data.object as { action?: string }).action === "kill_switch.release_requested",
+      15_000,
+    );
+    expect(OpsActionEvent.parse(action.data.object)).toMatchObject({ approval: (req.body as { id: string }).id });
     await probe.close();
   });
 });
