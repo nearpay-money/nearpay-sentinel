@@ -363,18 +363,21 @@ describe("single-person release (POST /internal/kill-switch, ops CLI)", () => {
     } finally {
       await server.stop();
     }
-    const err: string[] = [];
-    const code = await runOps(
-      ["kill-switch-release", "drill", "over"],
-      { ...s.sentinel, env: "server" },
-      {
-        actor: "cli@test",
-        out: () => {},
-        err: (l) => err.push(l),
-      },
-    );
-    expect(code).toBe(1);
-    expect(err.join("")).toMatch(/two_person_required/);
+    // Allow-list, not deny-list: an unknown stage or an empty NP_ENV is refused like `server` (audit finding 2).
+    for (const env of ["server", "staging", ""]) {
+      const err: string[] = [];
+      const code = await runOps(
+        ["kill-switch-release", "drill", "over"],
+        { ...s.sentinel, env },
+        {
+          actor: "cli@test",
+          out: () => {},
+          err: (l) => err.push(l),
+        },
+      );
+      expect(code, env).toBe(1);
+      expect(err.join("")).toMatch(/two_person_required/);
+    }
     const st = await s.admin.db.selectFrom("kill_switch").select("engaged").executeTakeFirstOrThrow();
     expect(st.engaged).toBe(true);
   });

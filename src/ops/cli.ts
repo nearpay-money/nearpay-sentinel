@@ -2,8 +2,8 @@
  * Stage 1 ops CLI (platform §3, lld/sentinel.md §15): `docker compose exec sentinel-api /nodejs/bin/node
  * dist/ops.js <command>`. Every command prints one JSON document; errors print `{"error": …}` and exit 1
  * (2: usage). Kill-switch changes are recorded in `kill_switch_log` with the operator (`cli@<host>`) and
- * emitted like any other change. From Stage 2 the single-person release is refused when `NP_ENV=server`
- * (`two_person_required`: the console's two-person release is the only one there) and stays on local/test.
+ * emitted like any other change. From Stage 2 the single-person release works only when `NP_ENV` is `local`
+ * or `test`; any other value is refused (`two_person_required`: the console's two-person release is the only one).
  */
 import { parseArgs } from "node:util";
 import { sql } from "@nearpay-internal/db";
