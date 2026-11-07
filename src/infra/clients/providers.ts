@@ -1,7 +1,11 @@
 /**
  * Provider status lookups with sentinel's own credentials (lld/sentinel.md §9): 1Click `/v0/status`
- * (own API key, 2 s, 1 retry; live bodies normalised, ./oneclick-normalize.ts) in live mode, the sandbox (1 s, service token) in test mode. Signatures
+ * (own API key, 2 s, 1 retry) in live mode, the sandbox (1 s, service token) in test mode. Signatures
  * are verified with the 1Click SDK — the pinned 1Click key live, the sandbox key in test mode.
+ *
+ * Both modes take the same path: bodies are normalised (./oneclick-normalize.ts) before validation, and a
+ * signature that does not verify as echoed gets rails' `quoteWaitingTimeMs` put back. The sandbox mirrors live
+ * 1Click's quirks, so test mode exercises this code.
  */
 import { verifyQuoteSignature } from "@defuse-protocol/one-click-sdk-typescript";
 import { HttpError, httpClient } from "@nearpay-internal/http";
@@ -35,8 +39,8 @@ function provider(o: {
   serviceToken?: () => Promise<string>;
   key?: string;
   fetch?: typeof fetch;
-  /** Live 1Click: normalise bodies before validation (./oneclick-normalize.ts). */
-  normalize?: boolean;
+  /** The `quoteWaitingTimeMs` rails quoted with, put back when the status echo omits it. */
+  quoteWaitingTimeMs: number;
 }): StatusProvider {
   const client = httpClient({
     target: o.target,
@@ -56,7 +60,7 @@ function provider(o: {
           headers: o.headers,
           query: { depositAddress: address, ...(memo ? { depositMemo: memo } : {}) },
         });
-        const parsed = OneClickStatusResponse.safeParse(o.normalize ? normalizeOneClick(res.body) : res.body);
+        const parsed = OneClickStatusResponse.safeParse(normalizeOneClick(res.body));
         if (!parsed.success) return { ok: false, kind: "unavailable", detail: "malformed status response" };
         return { ok: true, status: parsed.data };
       } catch (e) {
@@ -65,14 +69,19 @@ function provider(o: {
         return { ok: false, kind: "unavailable", detail: e instanceof Error ? e.message : String(e) };
       }
     },
-    verifySignature: (q) => {
-      try {
-        return o.key ? verifyQuoteSignature(q as never, o.key) : verifyQuoteSignature(q as never);
-      } catch {
-        return false; // a malformed signature or key never verifies
-      }
+    verifySignature(q) {
+      if (verify(q)) return true;
+      if (q.quoteRequest.quoteWaitingTimeMs !== undefined) return false;
+      return verify({ ...q, quoteRequest: { ...q.quoteRequest, quoteWaitingTimeMs: o.quoteWaitingTimeMs } });
     },
   };
+  function verify(q: OneClickQuoteResponse): boolean {
+    try {
+      return o.key ? verifyQuoteSignature(q as never, o.key) : verifyQuoteSignature(q as never);
+    } catch {
+      return false; // a malformed signature or key never verifies
+    }
+  }
 }
 
 /**
@@ -89,25 +98,16 @@ export function oneClickStatus(o: {
   managerPublicKey?: string;
   quoteWaitingTimeMs?: number;
 }): StatusProvider {
-  const base = provider({
+  return provider({
     target: "oneclick",
     baseUrl: o.baseUrl,
     timeoutMs: 2_000,
     attempts: 2,
     headers: oneClickAuthHeaders(o.apiKey),
-    normalize: true,
+    quoteWaitingTimeMs: o.quoteWaitingTimeMs ?? RAILS_QUOTE_WAITING_TIME_MS,
     ...(o.managerPublicKey ? { key: managerKey(o.managerPublicKey) } : {}),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
-  const wait = o.quoteWaitingTimeMs ?? RAILS_QUOTE_WAITING_TIME_MS;
-  return {
-    status: base.status,
-    verifySignature(q) {
-      if (base.verifySignature(q)) return true;
-      if (q.quoteRequest.quoteWaitingTimeMs !== undefined) return false;
-      return base.verifySignature({ ...q, quoteRequest: { ...q.quoteRequest, quoteWaitingTimeMs: wait } });
-    },
-  };
 }
 
 export interface SandboxStatus extends StatusProvider {
@@ -122,6 +122,7 @@ export function sandboxStatus(o: {
   signingPubkey: string;
   serviceToken: () => Promise<string>;
   fetch?: typeof fetch;
+  quoteWaitingTimeMs?: number;
 }): SandboxStatus {
   const p = provider({
     target: "sandbox",
@@ -130,6 +131,7 @@ export function sandboxStatus(o: {
     attempts: 1,
     headers: {},
     serviceToken: o.serviceToken,
+    quoteWaitingTimeMs: o.quoteWaitingTimeMs ?? RAILS_QUOTE_WAITING_TIME_MS,
     key: managerKey(o.signingPubkey),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
