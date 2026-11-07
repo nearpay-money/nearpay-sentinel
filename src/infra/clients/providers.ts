@@ -1,12 +1,13 @@
 /**
  * Provider status lookups with sentinel's own credentials (lld/sentinel.md §9): 1Click `/v0/status`
- * (own API key, 2 s, 1 retry) in live mode, the sandbox (1 s, service token) in test mode. Signatures
+ * (own API key, 2 s, 1 retry; live bodies normalised, ./oneclick-normalize.ts) in live mode, the sandbox (1 s, service token) in test mode. Signatures
  * are verified with the 1Click SDK — the pinned 1Click key live, the sandbox key in test mode.
  */
 import { verifyQuoteSignature } from "@defuse-protocol/one-click-sdk-typescript";
 import { HttpError, httpClient } from "@nearpay-internal/http";
 import { type OneClickQuoteResponse, OneClickStatusResponse, sandboxGetTx } from "@nearpay-internal/spec";
 import bs58 from "bs58";
+import { normalizeOneClick, oneClickAuthHeaders } from "./oneclick-normalize.js";
 
 export type StatusLookup =
   | { readonly ok: true; readonly status: OneClickStatusResponse }
@@ -34,6 +35,8 @@ function provider(o: {
   serviceToken?: () => Promise<string>;
   key?: string;
   fetch?: typeof fetch;
+  /** Live 1Click: normalise bodies before validation (./oneclick-normalize.ts). */
+  normalize?: boolean;
 }): StatusProvider {
   const client = httpClient({
     target: o.target,
@@ -53,7 +56,7 @@ function provider(o: {
           headers: o.headers,
           query: { depositAddress: address, ...(memo ? { depositMemo: memo } : {}) },
         });
-        const parsed = OneClickStatusResponse.safeParse(res.body);
+        const parsed = OneClickStatusResponse.safeParse(o.normalize ? normalizeOneClick(res.body) : res.body);
         if (!parsed.success) return { ok: false, kind: "unavailable", detail: "malformed status response" };
         return { ok: true, status: parsed.data };
       } catch (e) {
@@ -72,21 +75,39 @@ function provider(o: {
   };
 }
 
+/**
+ * rails quotes with `quoteWaitingTimeMs: 3000` (nearpay-rails app/executions.ts). 1Click signs it, but its
+ * `GET /v0/status` echo of the quote request omits the field, so a signature that does not verify as echoed is
+ * re-checked with rails' value put back. Everything else stays exactly as 1Click returned it.
+ */
+export const RAILS_QUOTE_WAITING_TIME_MS = 3_000;
+
 export function oneClickStatus(o: {
   baseUrl: string;
   apiKey?: string | undefined;
   fetch?: typeof fetch;
   managerPublicKey?: string;
-}) {
-  return provider({
+  quoteWaitingTimeMs?: number;
+}): StatusProvider {
+  const base = provider({
     target: "oneclick",
     baseUrl: o.baseUrl,
     timeoutMs: 2_000,
     attempts: 2,
-    headers: o.apiKey ? { "x-api-key": o.apiKey } : {},
+    headers: oneClickAuthHeaders(o.apiKey),
+    normalize: true,
     ...(o.managerPublicKey ? { key: managerKey(o.managerPublicKey) } : {}),
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
+  const wait = o.quoteWaitingTimeMs ?? RAILS_QUOTE_WAITING_TIME_MS;
+  return {
+    status: base.status,
+    verifySignature(q) {
+      if (base.verifySignature(q)) return true;
+      if (q.quoteRequest.quoteWaitingTimeMs !== undefined) return false;
+      return base.verifySignature({ ...q, quoteRequest: { ...q.quoteRequest, quoteWaitingTimeMs: wait } });
+    },
+  };
 }
 
 export interface SandboxStatus extends StatusProvider {
