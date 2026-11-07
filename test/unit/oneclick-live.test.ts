@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { oneClickAuthHeaders } from "../../src/infra/clients/oneclick-normalize.js";
-import { oneClickStatus } from "../../src/infra/clients/providers.js";
+import { oneClickStatus, sandboxStatus } from "../../src/infra/clients/providers.js";
 
 /** A real mainnet `GET /v0/status` body (PENDING_DEPOSIT, 2026-11-07), quoted by rails with quoteWaitingTimeMs 3000. */
 const live = readFileSync(new URL("../fixtures/oneclick-status-pending-live.json", import.meta.url), "utf8");
@@ -40,6 +40,21 @@ describe("live 1Click status (sentinel R1/R2)", () => {
     expect(p.verifySignature({ ...q, quoteRequest: { ...q.quoteRequest, quoteWaitingTimeMs: 2000 } })).toBe(false);
     const other = oneClickStatus({ baseUrl: "https://1click.test", fetch: fakeFetch(live), quoteWaitingTimeMs: 1000 });
     expect(other.verifySignature(q)).toBe(false);
+  });
+
+  it("test mode takes the same path: the sandbox provider normalises the body and puts rails' waiting time back", async () => {
+    // the real body through the sandbox provider, with 1Click's key standing in for the sandbox key
+    const p = sandboxStatus({
+      baseUrl: "http://sandbox.test",
+      signingPubkey: "ed25519:reYaWhvwu8Jzo3WUM3zhn6VrhuMEF4eADL17qtRVifc",
+      serviceToken: async () => "t",
+      fetch: fakeFetch(live),
+    });
+    const st = await p.status("0x77B262Cb4dB1Ca5021F773388F244F05b66bE8F2", null);
+    if (!st.ok) throw new Error(st.detail);
+    expect(p.verifySignature(st.status.quoteResponse)).toBe(true);
+    const q = st.status.quoteResponse;
+    expect(p.verifySignature({ ...q, quoteRequest: { ...q.quoteRequest, quoteWaitingTimeMs: 2000 } })).toBe(false);
   });
 
   it("auth headers: JWT → bearer, other keys → X-API-Key, none → nothing", () => {

@@ -36,7 +36,9 @@ afterAll(async () => {
   await s?.stop();
 });
 
-async function sandboxQuote(o: { recipient?: string; recipientType?: string; destinationAsset?: string } = {}) {
+async function sandboxQuote(
+  o: { recipient?: string; recipientType?: string; destinationAsset?: string; quoteWaitingTimeMs?: number } = {},
+) {
   const deadline = new Date(Date.now() + 30 * 60_000);
   deadline.setUTCMilliseconds(0);
   const r = await s.sandbox?.call("POST", "/v0/quote", {
@@ -54,6 +56,7 @@ async function sandboxQuote(o: { recipient?: string; recipientType?: string; des
     deadline: deadline.toISOString(),
     referral: "nearpay",
     appFees: [{ recipient: TREASURY, fee: 50 }],
+    quoteWaitingTimeMs: o.quoteWaitingTimeMs ?? 3000, // as rails quotes
   });
   expect(r?.status).toBe(200);
   return OneClickQuoteResponse.parse(r?.body);
@@ -73,7 +76,8 @@ function body(q: OneClickQuoteResponse) {
       chain: "eip155:8453",
       origin_asset_id: USDC_BASE,
       amount_in: q.quote.amountIn,
-      deadline: q.quote.deadline as string,
+      // the payer-facing deadline is the requested one (refunds begin), not quote.deadline (address inactive)
+      deadline: q.quoteRequest.deadline,
     },
   };
 }
@@ -149,6 +153,13 @@ const results = async (id: string) =>
 describe("test mode against the sandbox", () => {
   it("co-signs a sandbox quote (sandbox signing key, `sandbox|` deposit key) and audits its simulated settlement", async () => {
     const q = await sandboxQuote();
+    // the sandbox mirrors live 1Click: the address stays active 3 days past the requested deadline, and the
+    // status echo omits the signed quoteWaitingTimeMs (R2 puts rails' value back)
+    expect(Date.parse(q.quote.deadline as string) - Date.parse(q.quoteRequest.deadline)).toBe(3 * 86_400_000);
+    const echo = await s.sandbox?.call("GET", `/v0/status?depositAddress=${q.quote.depositAddress}`);
+    expect(OneClickStatusResponse.parse(echo?.body).quoteResponse.quoteRequest).not.toHaveProperty(
+      "quoteWaitingTimeMs",
+    );
     const r = await s.call("POST", PATH, { body: body(q) });
     expect(r.status).toBe(200);
     const signed = SignedAttestation.parse(r.body);
@@ -156,6 +167,7 @@ describe("test mode against the sandbox", () => {
     expect(signed.attestation).toMatchObject({
       livemode: false,
       destination: { asset_id: USDC_ARB, chain: "eip155:42161" },
+      expires_at: q.quoteRequest.deadline,
     });
 
     const st = await settle(q);
@@ -182,6 +194,13 @@ describe("test mode against the sandbox", () => {
     const w = (s.worker as NonNullable<Stack["worker"]>).sentinel;
     await audited(w, x);
     expect(await results(x.id)).toEqual({ destination: "pass", settlement: "pass" });
+  });
+
+  it("refuses a sandbox quote signed with a waiting time other than rails' (R2)", async () => {
+    const q = await sandboxQuote({ quoteWaitingTimeMs: 1000 });
+    const res = await s.call("POST", PATH, { body: body(q) });
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ error: { code: "attestation_refused" } });
   });
 
   it("refuses a sandbox quote whose fee does not pay the test treasury", async () => {
