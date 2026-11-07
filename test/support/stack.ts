@@ -18,8 +18,8 @@ import {
   type EventProbe,
   eventProbe,
   type MockPeer,
+  mintOpsToken,
   mintServiceToken,
-  mintTestToken,
   mockPeer,
   provisionServiceDatabase,
   type Started,
@@ -45,6 +45,8 @@ export const SANDBOX_IMAGE = process.env.NP_SANDBOX_IMAGE ?? "nearpay/sandbox:lo
 export const TREASURY = "treasury.nearpay.near";
 export const LIVE_TREASURY = "intents.near"; // the recorded quote's appFee recipient
 export const KID = "sent-it-1";
+/** Operator of `opsToken()` (a console operator calling `POST /internal/kill-switch`). */
+export const OPS_CLI_OPERATOR = "usr_01m6vree6ye928jvj2vxkyyz08";
 
 async function freePort(): Promise<number> {
   const s = createServer();
@@ -396,15 +398,13 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
       const text = await res.text();
       return { status: res.status, body: text ? JSON.parse(text) : undefined, headers: res.headers };
     },
-    opsToken: (scopes = ["sentinel.killswitch"]) => mintTestToken({ sub: "ops-alice", ptype: "ops", scp: scopes }),
+    opsToken: (scopes = ["sentinel.killswitch"]) => mintOpsToken({ sub: OPS_CLI_OPERATOR, role: "ops", scopes }),
     operatorToken: (t) =>
-      mintTestToken({
+      mintOpsToken({
         sub: t.sub,
-        ptype: "ops",
-        scp: t.scopes ?? ["sentinel.read", "sentinel.killswitch", "sentinel.findings.write"],
-        ...(t.stepUp === false ? {} : { step_up_until: t.stepUpUntil ?? Math.floor(Date.now() / 1000) + 600 }),
-        // `ops_role` is a spec 0.2.0 claim the 0.1.2 kit's claim input type does not list yet
-        ...({ ops_role: t.role ?? "ops" } as object),
+        role: t.role ?? "ops",
+        ...(t.scopes ? { scopes: t.scopes } : {}),
+        stepUp: t.stepUp === false ? false : t.stepUpUntil ? t.stepUpUntil - Math.floor(Date.now() / 1000) : true,
       }),
     async extraApi(over) {
       const { service } = createApi({ ...config, ...over } as WorkerConfig, {

@@ -8,6 +8,7 @@
 
 import { sql } from "@nearpay-internal/db";
 import { fromUuid, newId, toUuid, uuidv7 } from "@nearpay-internal/ids";
+import { mintServiceToken, mintTestToken } from "@nearpay-internal/testing";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { runOps } from "../../src/ops/cli.js";
 import { type Stack, startStack } from "../support/stack.js";
@@ -69,11 +70,14 @@ async function resetSwitch() {
 
 beforeEach(resetSwitch);
 
-describe("authorization (in-handler, independent of the service package)", () => {
+describe("authorization (service package + in-handler re-check)", () => {
   it("needs an ops principal with an operator id and an admitted ops_role", async () => {
     expect((await s.call("GET", "/ops/kill_switch")).status).toBe(401);
-    const noRole = await s.opsToken(["sentinel.read"]); // sub is not usr_…, no ops_role
+    // an ops token without ops_role, and a service token, are refused
+    const noRole = await mintTestToken({ sub: newId("usr"), ptype: "ops", scp: ["sentinel.read"] });
     expect((await s.call("GET", "/ops/kill_switch", { token: noRole })).status).toBe(403);
+    const svc = await mintServiceToken("rails");
+    expect((await s.call("GET", "/ops/kill_switch", { token: svc })).status).toBe(403);
     const r = await s.call("GET", "/ops/kill_switch", { token: await tok(alice, "ops", false) });
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ engaged: false, pending_release: null });

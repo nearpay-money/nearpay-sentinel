@@ -8,6 +8,7 @@ import type { ProviderSplit } from "../address-integrity/checks.js";
 import type { SigningKey } from "../co-signer/crypto.js";
 import type { EvmReader, NearReader } from "../infra/clients/chains.js";
 import type { SandboxStatus, StatusProvider } from "../infra/clients/providers.js";
+import type { TokenRegistry } from "../infra/clients/tokens.js";
 import type { DB, RegistryDB } from "../infra/db/schema.js";
 
 export type Tx = Transaction<DB>;
@@ -121,6 +122,9 @@ export interface Sentinel {
   readonly ticketKey: KeyObject;
   readonly live: StatusProvider | null;
   readonly test: SandboxStatus | null;
+  /** The provider's token registry per mode (attested asset display data, CR-15-07); null: not configured. */
+  readonly liveTokens: TokenRegistry | null;
+  readonly testTokens: TokenRegistry | null;
   readonly rails: RailsClient;
   readonly cache: AttestationCache;
   readonly treasury: string | null;

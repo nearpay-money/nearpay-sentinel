@@ -11,6 +11,7 @@ export default defineConfig({
         "src/independent-reconciliation/audit.ts",
         "src/co-signer/crypto.ts",
         "src/kill-switch/two-person.ts",
+        "src/co-signer/attestation.ts",
       ],
       reporter: ["text", "json-summary"],
       thresholds: { branches: 90 },

@@ -6,13 +6,15 @@
  */
 
 import type { createDepositInstructionsAttestation } from "@nearpay/spec";
-import { type Attestation, routeQuoteDepositKey, type SignedAttestation } from "@nearpay/spec";
-import { destinationFingerprint } from "@nearpay-internal/chains";
+import { routeQuoteDepositKey, type SignedAttestation } from "@nearpay/spec";
 import { uuidv7 } from "@nearpay-internal/ids";
 import { ApiError, type RouteBodyOut } from "@nearpay-internal/service";
+import { attestedAsset } from "../address-integrity/assets.js";
 import { type CheckFailure, checkIntents, checkRouteQuote, type RegistryRow } from "../address-integrity/checks.js";
 import type { Sentinel } from "../app/context.js";
+import { TokensUnavailable } from "../infra/clients/tokens.js";
 import { setKillSwitch } from "../kill-switch/kill-switch.js";
+import { buildAttestation } from "./attestation.js";
 import { signAttestation, verifyTicket } from "./crypto.js";
 
 export type AttestBody = RouteBodyOut<typeof createDepositInstructionsAttestation>;
@@ -92,28 +94,6 @@ async function record(
       expires_at: o.response ? new Date(o.response.attestation.expires_at) : null,
     })
     .execute();
-}
-
-function attestation(s: Sentinel, b: AttestBody, row: RegistryRow, expiresAt: string): Attestation {
-  const issued = new Date(Math.floor(s.now() / 1000) * 1000).toISOString();
-  return {
-    v: 1,
-    kind: b.kind,
-    attempt_id: b.attempt_id,
-    livemode: b.livemode,
-    ...(b.kind === "route_quote" && b.deposit ? { deposit: { ...b.deposit } } : {}),
-    ...(b.kind === "intents_transfer" && b.requirement
-      ? { requirement: { ...b.requirement } as Attestation["requirement"] }
-      : {}),
-    merchant: { name: row.merchant_name, kyb_verified: row.kyb_verified },
-    destination: {
-      asset_id: row.asset_id,
-      chain: row.chain,
-      fingerprint: destinationFingerprint(row.chain, row.address_norm, row.asset_id),
-    },
-    issued_at: issued,
-    expires_at: new Date(expiresAt).toISOString(),
-  };
 }
 
 /** Cache value (`att:<deposit_key>`): the signed response and the destination it vouches for. */
@@ -213,6 +193,7 @@ async function checked(
   // 3. checks
   const treasury = b.livemode ? s.treasury : s.testTreasury;
   let outcome: { ok: true; row: RegistryRow } | ({ ok: false } & CheckFailure);
+  let signedAmount: { amountIn: string; amountInFormatted: string } | undefined;
   if (b.kind === "route_quote" && b.deposit) {
     const provider = b.livemode ? s.live : s.test;
     if (!provider) {
@@ -232,6 +213,7 @@ async function checked(
       throw new ApiError("attestation_unavailable");
     }
     const q = st.status.quoteResponse;
+    signedAmount = { amountIn: q.quote.amountIn, amountInFormatted: q.quote.amountInFormatted };
     outcome = checkRouteQuote({
       livemode: b.livemode,
       deposit: b.deposit,
@@ -263,9 +245,36 @@ async function checked(
     throw new ApiError("attestation_refused");
   }
 
-  // 4. sign
-  const expires = b.kind === "route_quote" ? (b.deposit?.deadline as string) : (b.requirement?.deadline as string);
-  const signed = signAttestation(attestation(s, b, outcome.row, expires), s.signingKey);
+  // 4. the asset the payer sends: display data from sentinel's own read of the provider's token registry,
+  //    consistent with the signed quote (CR-15-07); never from the request
+  const assetId = b.kind === "route_quote" ? (b.deposit?.origin_asset_id as string) : (b.requirement?.token as string);
+  const tokens = b.livemode ? s.liveTokens : s.testTokens;
+  let display: Awaited<ReturnType<NonNullable<typeof tokens>["asset"]>> = null;
+  let why: string | null = tokens ? null : "token registry not configured";
+  if (tokens) {
+    try {
+      display = await tokens.asset(assetId);
+    } catch (e) {
+      if (!(e instanceof TokensUnavailable)) throw e;
+      why = e.message;
+    }
+  }
+  const asset = why === null ? attestedAsset(assetId, display, signedAmount) : { ok: false as const, reason: why };
+  if (!asset.ok) {
+    await record(s, b, depositKey, {
+      result: "unavailable",
+      cls: "unavailable",
+      reasons: [`asset: ${asset.reason}`.slice(0, 500)],
+      row: outcome.row,
+      ip,
+    });
+    done("unavailable", "asset");
+    s.log.error({ asset: assetId, reason: asset.reason, livemode: b.livemode }, "attested asset unavailable");
+    throw new ApiError("attestation_unavailable");
+  }
+
+  // 5. sign
+  const signed = signAttestation(buildAttestation(b, outcome.row, asset.asset, s.now()), s.signingKey);
   await record(s, b, depositKey, { result: "signed", row: outcome.row, response: signed, ip });
   const entry: CacheEntry = { destination_id: outcome.row.id, response: signed };
   await s.cache.set(depositKey, JSON.stringify(entry), Date.parse(signed.attestation.expires_at));

@@ -167,6 +167,8 @@ describe("test mode against the sandbox", () => {
     expect(signed.attestation).toMatchObject({
       livemode: false,
       destination: { asset_id: USDC_ARB, chain: "eip155:42161" },
+      // display data from the sandbox's token registry, consistent with its signed amountInFormatted
+      asset: { asset_id: USDC_BASE, symbol: "USDC", decimals: 6 },
       expires_at: q.quoteRequest.deadline,
     });
 
@@ -255,6 +257,7 @@ describe("test mode against the sandbox", () => {
     expect(signed.attestation).toMatchObject({
       kind: "intents_transfer",
       requirement,
+      asset: { asset_id: requirement.token, decimals: 6 },
       expires_at: requirement.deadline,
     });
     expect(signed.attestation.deposit).toBeUndefined();
