@@ -138,8 +138,14 @@ export function checkRouteQuote(i: RouteQuoteInput): { ok: true; row: RegistryRo
   // NEAR; otherwise the origin asset's own chain, whenever its id says so
   const depositChain = q.quoteRequest.depositType === "INTENTS" ? NEAR : assetChain(q.quoteRequest.originAsset);
   if (depositChain !== null && i.deposit.chain !== depositChain) security.push("R4 deposit chain differs");
-  const qd = q.quote.deadline ? Date.parse(q.quote.deadline) : Number.NaN;
+  // The payer-facing deadline is when 1Click starts refunding: the signed quoteRequest.deadline. Live 1Click's
+  // quote.deadline is when the deposit address goes inactive (3 days later on mainnet, 2026-11-07; the sandbox
+  // sets both equal), so it must not end before refunds begin.
+  const qd = Date.parse(q.quoteRequest.deadline);
   if (!Number.isFinite(qd) || qd !== Date.parse(i.deposit.deadline)) security.push("R4 deadline differs");
+  const inactive = q.quote.deadline ? Date.parse(q.quote.deadline) : Number.NaN;
+  if (!Number.isFinite(inactive) || inactive < qd)
+    security.push("R4 deposit address goes inactive before the deadline");
   if (!i.treasury) security.push("R6 no treasury configured for this mode");
   else security.push(...appFeesFailures(q.quoteRequest.appFees, i.treasury, i.split).map((r) => `R6 ${r}`));
   const match = matchRegistry(i.registry, {
