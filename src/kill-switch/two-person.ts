@@ -10,6 +10,17 @@
 
 export const RELEASE_TTL_MS = 60 * 60_000;
 
+/** The only `NP_ENV` values on which the single-person release (CLI, `POST /internal/kill-switch`) is allowed. */
+export const SINGLE_PERSON_ENVS: ReadonlySet<string> = new Set(["local", "test"]);
+
+/**
+ * Allow-list, fail closed: `server`, an unknown stage, an empty or mistyped value all require two persons
+ * (audit finding 2, stage 2).
+ */
+export function singlePersonAllowed(env: string): boolean {
+  return SINGLE_PERSON_ENVS.has(env);
+}
+
 export type OpsRole = "ops" | "ops_admin";
 export type ReleaseStatus = "pending" | "approved" | "rejected" | "expired";
 

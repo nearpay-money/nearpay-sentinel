@@ -10,6 +10,7 @@ import { emit } from "@nearpay-internal/db";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import type { Sentinel, Tx } from "../app/context.js";
+import { singlePersonAllowed } from "./two-person.js";
 
 /** The kill switch aggregate (a singleton). */
 export const KILL_SWITCH_ID = fromUuid("ks", "01900000-0000-7000-8000-00000000c0de");
@@ -77,8 +78,9 @@ export async function expirePending(t: Tx, note: string): Promise<number> {
 
 /**
  * The single-person path (`POST /internal/kill-switch`, ops CLI): engaging always works; releasing is
- * refused with `409 two_person_required` when `NP_ENV=server` (the console's request + approval is the
- * only release there) and stays available on local and test stacks (testbed T7).
+ * allowed only when `NP_ENV` is `local` or `test` (testbed T7); on any other value — `server`, an unknown
+ * stage, a mistyped one — it is refused with `409 two_person_required` (the console's request + approval is
+ * the only release there).
  */
 export async function setKillSwitchSinglePerson(
   s: Pick<Sentinel, "db" | "log" | "metrics" | "env">,
@@ -86,8 +88,8 @@ export async function setKillSwitchSinglePerson(
   reason: string,
   actor: string,
 ): Promise<KillSwitchState> {
-  if (!engaged && s.env === "server") {
-    s.log.warn({ actor }, "single-person kill-switch release refused on the server stage");
+  if (!engaged && !singlePersonAllowed(s.env)) {
+    s.log.warn({ actor, env: s.env }, "single-person kill-switch release refused outside local/test");
     throw new ApiError("two_person_required");
   }
   return setKillSwitch(s, engaged, reason, actor);
