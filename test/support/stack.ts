@@ -196,6 +196,16 @@ export interface Stack {
     o?: { body?: unknown; token?: string | null; headers?: Record<string, string> },
   ): Promise<{ status: number; body: unknown; headers: Headers }>;
   opsToken(scopes?: string[]): Promise<string>;
+  /** A console operator token (`ptype=ops`, `sub` = `usr_…`, `ops_role`; step-up fresh unless `stepUp: false`). */
+  operatorToken(o: {
+    sub: string;
+    role?: "ops" | "ops_admin";
+    stepUp?: boolean;
+    stepUpUntil?: number;
+    scopes?: string[];
+  }): Promise<string>;
+  /** Another api process on the same databases with a config override (e.g. `env: "server"`). */
+  extraApi(over: Partial<WorkerConfig>): Promise<{ call: Stack["call"]; stop(): Promise<void> }>;
   publishEvent(e: Envelope): Promise<void>;
   probe(filter?: string): Promise<EventProbe>;
   stop(): Promise<void>;
@@ -387,6 +397,41 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
       return { status: res.status, body: text ? JSON.parse(text) : undefined, headers: res.headers };
     },
     opsToken: (scopes = ["sentinel.killswitch"]) => mintTestToken({ sub: "ops-alice", ptype: "ops", scp: scopes }),
+    operatorToken: (t) =>
+      mintTestToken({
+        sub: t.sub,
+        ptype: "ops",
+        scp: t.scopes ?? ["sentinel.read", "sentinel.killswitch", "sentinel.findings.write"],
+        ...(t.stepUp === false ? {} : { step_up_until: t.stepUpUntil ?? Math.floor(Date.now() / 1000) + 600 }),
+        // `ops_role` is a spec 0.2.0 claim the 0.1.2 kit's claim input type does not list yet
+        ...({ ops_role: t.role ?? "ops" } as object),
+      }),
+    async extraApi(over) {
+      const { service } = createApi({ ...config, ...over } as WorkerConfig, {
+        ...deps,
+        database: createDb<DB>({ url: appUrl, applicationName: "sentinel-api-extra" }),
+        registry: createDb<RegistryDB>({ url: config.registryDbUrl, applicationName: "sentinel-api-extra" }),
+        cache: attestationCache(undefined),
+      });
+      const { port: p } = await service.start();
+      const base = `http://127.0.0.1:${p}`;
+      return {
+        async call(method, path, c = {}) {
+          const res = await fetch(`${base}${path}`, {
+            method,
+            headers: {
+              ...(c.token ? { "x-nearpay-token": c.token } : {}),
+              ...(c.body !== undefined ? { "content-type": "application/json" } : {}),
+              ...c.headers,
+            },
+            body: c.body === undefined ? undefined : JSON.stringify(c.body),
+          });
+          const text = await res.text();
+          return { status: res.status, body: text ? JSON.parse(text) : undefined, headers: res.headers };
+        },
+        stop: () => service.stop(),
+      };
+    },
     async publishEvent(e) {
       if (!bus) throw new Error("no bus (start the stack with a worker)");
       await publish(bus, e.subject, e, e.id);

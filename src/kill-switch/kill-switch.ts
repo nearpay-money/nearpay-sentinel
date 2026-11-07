@@ -1,11 +1,14 @@
 /**
  * The global quoting kill switch (lld/sentinel.md §8): one row, versioned; every change appends to
  * `kill_switch_log` and emits `evt.sentinel.kill_switch.engaged|released` in the same transaction.
- * Rails stops live quotes when it consumes `engaged`. Stage 1 releases through the ops CLI (the
- * two-person release arrives with the Stage 2 console).
+ * Rails stops live quotes when it consumes `engaged`. From Stage 2 the console's two-person release
+ * (./release.ts) is the only release on the server stage; the single-person release of the ops CLI and
+ * `POST /internal/kill-switch` answers `409 two_person_required` there and stays on local/test stacks.
+ * Every change also expires a pending release request (it was for the previous version).
  */
 import { emit } from "@nearpay-internal/db";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
+import { ApiError } from "@nearpay-internal/service";
 import type { Sentinel, Tx } from "../app/context.js";
 
 /** The kill switch aggregate (a singleton). */
@@ -41,6 +44,7 @@ export async function setKillSwitch(
       .where("id", "=", 1)
       .returningAll()
       .executeTakeFirstOrThrow();
+    await expirePending(t, "the kill switch changed");
     await t
       .insertInto("kill_switch_log")
       .values({ id: uuidv7(), engaged, reason: next.reason, actor: next.actor, version })
@@ -59,4 +63,32 @@ export async function setKillSwitch(
   if (engaged) s.log.error({ reason, actor }, "ALERT kill switch engaged: live quoting stopped");
   else s.log.warn({ reason, actor }, "kill switch released");
   return state;
+}
+
+/** Marks every pending release request `expired` (inside the caller's transaction). */
+export async function expirePending(t: Tx, note: string): Promise<number> {
+  const r = await t
+    .updateTable("release_requests")
+    .set({ status: "expired", decision_note: note.slice(0, 500) })
+    .where("status", "=", "pending")
+    .executeTakeFirst();
+  return Number(r.numUpdatedRows);
+}
+
+/**
+ * The single-person path (`POST /internal/kill-switch`, ops CLI): engaging always works; releasing is
+ * refused with `409 two_person_required` when `NP_ENV=server` (the console's request + approval is the
+ * only release there) and stays available on local and test stacks (testbed T7).
+ */
+export async function setKillSwitchSinglePerson(
+  s: Pick<Sentinel, "db" | "log" | "metrics" | "env">,
+  engaged: boolean,
+  reason: string,
+  actor: string,
+): Promise<KillSwitchState> {
+  if (!engaged && s.env === "server") {
+    s.log.warn({ actor }, "single-person kill-switch release refused on the server stage");
+    throw new ApiError("two_person_required");
+  }
+  return setKillSwitch(s, engaged, reason, actor);
 }
