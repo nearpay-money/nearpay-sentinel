@@ -3,15 +3,16 @@
  * (own API key, 2 s, 1 retry) in live mode, the sandbox (1 s, service token) in test mode. Signatures
  * are verified with the 1Click SDK — the pinned 1Click key live, the sandbox key in test mode.
  *
- * Both modes take the same path: bodies are normalised (./oneclick-normalize.ts) before validation, and a
- * signature that does not verify as echoed gets rails' `quoteWaitingTimeMs` put back. The sandbox mirrors live
- * 1Click's quirks, so test mode exercises this code.
+ * Both modes take the same path: bodies are validated exactly as received against the spec's live 1Click
+ * shape (spec 0.2.0: optional fields nullish, nested `quoteResponse.correlationId` optional — the Stage 1
+ * normalisation is gone), and a signature that does not verify as echoed gets rails' `quoteWaitingTimeMs` put
+ * back. The sandbox mirrors live 1Click's quirks, so test mode exercises this code.
  */
 import { verifyQuoteSignature } from "@defuse-protocol/one-click-sdk-typescript";
 import { HttpError, httpClient } from "@nearpay-internal/http";
-import { type OneClickQuoteResponse, OneClickStatusResponse, sandboxGetTx } from "@nearpay-internal/spec";
+import { type OneClickStatusQuoteResponse, OneClickStatusResponse, sandboxGetTx } from "@nearpay-internal/spec";
 import bs58 from "bs58";
-import { normalizeOneClick, oneClickAuthHeaders } from "./oneclick-normalize.js";
+import { oneClickAuthHeaders } from "./oneclick-auth.js";
 
 export type StatusLookup =
   | { readonly ok: true; readonly status: OneClickStatusResponse }
@@ -19,7 +20,7 @@ export type StatusLookup =
 
 export interface StatusProvider {
   status(address: string, memo: string | null): Promise<StatusLookup>;
-  verifySignature(q: OneClickQuoteResponse): boolean;
+  verifySignature(q: OneClickStatusQuoteResponse): boolean;
 }
 
 /** `ed25519:<base58>` from a base64url raw key (or an `ed25519:` key as is). */
@@ -60,7 +61,7 @@ function provider(o: {
           headers: o.headers,
           query: { depositAddress: address, ...(memo ? { depositMemo: memo } : {}) },
         });
-        const parsed = OneClickStatusResponse.safeParse(normalizeOneClick(res.body));
+        const parsed = OneClickStatusResponse.safeParse(res.body);
         if (!parsed.success) return { ok: false, kind: "unavailable", detail: "malformed status response" };
         return { ok: true, status: parsed.data };
       } catch (e) {
@@ -71,11 +72,12 @@ function provider(o: {
     },
     verifySignature(q) {
       if (verify(q)) return true;
-      if (q.quoteRequest.quoteWaitingTimeMs !== undefined) return false;
+      // null and absent are both "unset" (the SDK hashes neither)
+      if (q.quoteRequest.quoteWaitingTimeMs != null) return false;
       return verify({ ...q, quoteRequest: { ...q.quoteRequest, quoteWaitingTimeMs: o.quoteWaitingTimeMs } });
     },
   };
-  function verify(q: OneClickQuoteResponse): boolean {
+  function verify(q: OneClickStatusQuoteResponse): boolean {
     try {
       return o.key ? verifyQuoteSignature(q as never, o.key) : verifyQuoteSignature(q as never);
     } catch {

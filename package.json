@@ -31,8 +31,8 @@
     "@nearpay-internal/intents": "0.1.2",
     "@nearpay-internal/money": "0.1.2",
     "@nearpay-internal/service": "0.1.2",
-    "@nearpay-internal/spec": "0.1.4",
-    "@nearpay/spec": "0.1.4",
+    "@nearpay-internal/spec": "0.2.0",
+    "@nearpay/spec": "0.2.0",
     "bs58": "6.0.0",
     "canonicalize": "5.1.0",
     "ioredis": "6.0.0",
@@ -51,8 +51,8 @@
   },
   "pnpm": {
     "overrides": {
-      "@nearpay/spec": "0.1.4",
-      "@nearpay-internal/spec": "0.1.4"
+      "@nearpay/spec": "0.2.0",
+      "@nearpay-internal/spec": "0.2.0"
     },
     "onlyBuiltDependencies": [
       "esbuild",
