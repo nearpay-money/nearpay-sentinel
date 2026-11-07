@@ -31,6 +31,7 @@ function quote(mut?: (q: OneClickQuoteResponse) => void): OneClickQuoteResponse 
   const q = recorded();
   q.quoteRequest.dry = false;
   q.quote.depositAddress = DEPOSIT;
+  q.quoteRequest.deadline = DEADLINE;
   q.quote.deadline = DEADLINE;
   mut?.(q);
   return q;
@@ -111,6 +112,12 @@ describe("route_quote checks", () => {
     expect(checkRouteQuote(input())).toEqual({ ok: true, row: row() });
   });
 
+  it("R4 live shape: quote.deadline (address inactive) days after the request deadline (refunds begin) passes", () => {
+    // mainnet 1Click, 2026-11-07: quoteRequest.deadline 12:29:33Z, quote.deadline 3 days later
+    const q = quote((x) => (x.quote.deadline = "2026-11-08T18:26:53.000Z"));
+    expect(checkRouteQuote(input({ q }))).toEqual({ ok: true, row: row() });
+  });
+
   const security: [string, Partial<Parameters<typeof input>[0]>, RegExp][] = [
     ["R2 signature", { signatureValid: false }, /^R2 /],
     ["R3 referral", { q: quote((q) => (q.quoteRequest.referral = "someone")) }, /^R3 /],
@@ -123,8 +130,13 @@ describe("route_quote checks", () => {
     ["R4 memo", { q: quote((q) => (q.quote.depositMemo = "123")) }, /R4 deposit memo/],
     ["R4 origin asset", { q: quote((q) => (q.quoteRequest.originAsset = USDC_NEAR)) }, /R4 origin asset/],
     ["R4 amount", { q: quote((q) => (q.quote.amountIn = "1")) }, /R4 amount/],
-    ["R4 deadline", { q: quote((q) => (q.quote.deadline = "2026-11-05T18:26:54.000Z")) }, /R4 deadline/],
-    ["R4 no deadline", { q: quote((q) => delete q.quote.deadline) }, /R4 deadline/],
+    ["R4 deadline", { q: quote((q) => (q.quoteRequest.deadline = "2026-11-05T18:26:54.000Z")) }, /R4 deadline differs/],
+    [
+      "R4 address inactive before the deadline",
+      { q: quote((q) => (q.quote.deadline = "2026-11-05T18:00:00.000Z")) },
+      /R4 deposit address goes inactive/,
+    ],
+    ["R4 no address deadline", { q: quote((q) => delete q.quote.deadline) }, /R4 deposit address goes inactive/],
     [
       "R5 unknown recipient",
       { registry: [row({ address_norm: "0x1111111111111111111111111111111111111111" })] },
