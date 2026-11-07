@@ -63,3 +63,17 @@ describe("live 1Click status (sentinel R1/R2)", () => {
     expect(oneClickAuthHeaders(undefined)).toEqual({});
   });
 });
+
+describe("what the 1Click signature covers (real mainnet body)", () => {
+  it("covers quote.deadline but not quoteRequest.deadline (the SDK spreads the quote over the request)", async () => {
+    const p = oneClickStatus({ baseUrl: "https://1click.test", fetch: fakeFetch(live) });
+    const st = await p.status("0x77B262Cb4dB1Ca5021F773388F244F05b66bE8F2", null);
+    if (!st.ok) throw new Error("status");
+    const q = st.status.quoteResponse;
+    expect(p.verifySignature({ ...q, quote: { ...q.quote, deadline: "2030-01-01T00:00:00.000Z" } })).toBe(false);
+    // documented in checks.ts R4: the request deadline is trusted via TLS from 1Click (R1), not the signature
+    expect(p.verifySignature({ ...q, quoteRequest: { ...q.quoteRequest, deadline: "2030-01-01T00:00:00.000Z" } })).toBe(
+      true,
+    );
+  });
+});

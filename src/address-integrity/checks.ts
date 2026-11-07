@@ -138,7 +138,9 @@ export function checkRouteQuote(i: RouteQuoteInput): { ok: true; row: RegistryRo
   // NEAR; otherwise the origin asset's own chain, whenever its id says so
   const depositChain = q.quoteRequest.depositType === "INTENTS" ? NEAR : assetChain(q.quoteRequest.originAsset);
   if (depositChain !== null && i.deposit.chain !== depositChain) security.push("R4 deposit chain differs");
-  // The payer-facing deadline is when 1Click starts refunding: the signed quoteRequest.deadline. Live 1Click's
+  // The payer-facing deadline is when 1Click starts refunding: quoteRequest.deadline. It is NOT covered by the
+  // quote signature (the SDK hashes {...request, ...quote}, so quote.deadline overwrites it); it is trusted
+  // because sentinel reads it from 1Click itself over TLS (R1), never from rails or checkout. Live 1Click's
   // quote.deadline is when the deposit address goes inactive (3 days later on mainnet, 2026-11-07; the sandbox
   // sets both equal), so it must not end before refunds begin.
   const qd = Date.parse(q.quoteRequest.deadline);
