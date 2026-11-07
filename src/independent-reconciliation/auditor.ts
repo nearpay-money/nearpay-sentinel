@@ -3,7 +3,8 @@
  * the `evt.rails.execution.settled` consumer enqueues. Two findings per sampled execution:
  *
  * - `destination` — the recipient was the account's registered destination (identity's registry
- *   view), active when the execution was created;
+ *   view), active when the execution was created; for a refund leg (`kind: refund`) the same of its
+ *   source (`origin.refund_to`), since the recipient is the payer;
  * - `settlement` — rails' settlement is self-consistent and sentinel's own read shows it: the
  *   destination chain with sentinel's RPC credentials (Tier A: EVM, NEAR), the sandbox's simulated
  *   chain (test mode), or the provider's signed status with sentinel's key (Tier B, and live chains
@@ -25,6 +26,7 @@ import {
   type AuditResult,
   attribute,
   consistencyFailures,
+  destinationSide,
   destinationVerdict,
   nearTransfers,
   normalRecipient,
@@ -98,6 +100,7 @@ export function usdMicros(amount: bigint, decimals: number, price: string): bigi
 // ------------------------------------------------------------------------------------- checks
 
 async function destinationCheck(s: Sentinel, x: Execution): Promise<Verdict> {
+  const { side, view } = destinationSide(x);
   let rows: Parameters<typeof destinationVerdict>[1];
   try {
     rows = await s.registry
@@ -105,13 +108,17 @@ async function destinationCheck(s: Sentinel, x: Execution): Promise<Verdict> {
       .select(["id", "type", "chain", "address_norm", "status", "active_at", "disabled_at"])
       .where("account_id", "=", toUuid(x.account_id, "acct"))
       .where("livemode", "=", x.livemode)
-      .where("asset_id", "=", x.settlement.asset_id)
+      .where("asset_id", "=", view.settlement.asset_id)
       .execute();
   } catch (e) {
     throw new AuditRetry(`registry unreachable: ${e instanceof Error ? e.message : String(e)}`);
   }
-  const v = destinationVerdict(x, rows);
-  return verdict(v.result, v.reason, { recipient: x.settlement.recipient, asset_id: x.settlement.asset_id });
+  const v = destinationVerdict(view, rows);
+  return verdict(v.result, side === "refund_source" ? `refund source: ${v.reason}` : v.reason, {
+    side,
+    [side === "refund_source" ? "source" : "recipient"]: view.settlement.recipient,
+    asset_id: view.settlement.asset_id,
+  });
 }
 
 async function settlementCheck(s: Sentinel, x: Execution): Promise<Verdict> {

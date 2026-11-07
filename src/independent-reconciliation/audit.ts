@@ -115,7 +115,49 @@ export function consistencyFailures(x: Execution): string[] {
     out.push(`asset ${x.settlement.asset_id} does not live on ${x.settlement.chain}`);
   if (x.settled_amount === null) out.push("no settled amount");
   else if (x.settled_amount !== e.amount) out.push(`settled ${x.settled_amount} != evidence ${e.amount}`);
+  return [...out, ...refundFailures(x)];
+}
+
+/**
+ * Refund legs (`kind: refund`, spec 0.2.0): `origin` is the merchant side (`refund_to` = the merchant's
+ * destination, the source of the refund) and `settlement` the payer side. A leg from an Intents account
+ * carries the one transfer the merchant signed; it must be from that destination, in the source asset.
+ */
+export function refundFailures(x: Pick<Execution, "kind" | "origin" | "refund">): string[] {
+  if (x.kind !== "refund") return [];
+  const t = x.refund?.transfer;
+  if (!t) return [];
+  const out: string[] = [];
+  if (x.origin.refund_type !== "intents") out.push("refund transfer from a non-Intents source");
+  if (t.signer_id.toLowerCase() !== x.origin.refund_to.toLowerCase())
+    out.push("refund transfer is not signed by the refund source");
+  if (t.token !== x.origin.asset_id) out.push("refund transfer asset is not the source asset");
   return out;
+}
+
+/**
+ * What the `destination` finding checks: for a payment, the recipient (the merchant's destination); for a
+ * refund leg, the source (`origin.refund_to`, which must be the account's destination) — the payer's refund
+ * address is not a registry entry. Returned in the settlement shape {@link destinationVerdict} reads.
+ */
+export function destinationSide(x: Pick<Execution, "kind" | "origin" | "settlement" | "created_at">): {
+  readonly side: "recipient" | "refund_source";
+  readonly view: Pick<Execution, "settlement" | "created_at">;
+} {
+  if (x.kind !== "refund") return { side: "recipient", view: x };
+  return {
+    side: "refund_source",
+    view: {
+      created_at: x.created_at,
+      settlement: {
+        ...x.settlement,
+        asset_id: x.origin.asset_id,
+        recipient: x.origin.refund_to,
+        recipient_type: x.origin.refund_type === "intents" ? "intents" : "destination_chain",
+        chain: x.origin.chain,
+      },
+    },
+  };
 }
 
 /**

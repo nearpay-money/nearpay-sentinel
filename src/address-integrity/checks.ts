@@ -11,7 +11,7 @@
  * `appFees` and diverts nothing, so it passes.
  */
 import { normalizeAddress } from "@nearpay-internal/chains";
-import type { OneClickQuoteResponse } from "@nearpay-internal/spec";
+import type { OneClickStatusQuoteResponse } from "@nearpay-internal/spec";
 import { assetChain, NEAR } from "./assets.js";
 
 export type FailureClass = "security" | "ambiguous" | "stale" | "unavailable";
@@ -54,7 +54,7 @@ const OPEN = new Set(["PENDING_DEPOSIT", "KNOWN_DEPOSIT_TX", "INCOMPLETE_DEPOSIT
 
 /** R6: the treasury's appFee, split-aware (see module doc). */
 export function appFeesFailures(
-  fees: readonly { recipient: string; fee: number }[] | undefined,
+  fees: readonly { recipient: string; fee: number }[] | null | undefined,
   treasury: string,
   split: ProviderSplit,
 ): string[] {
@@ -114,7 +114,7 @@ export function matchRegistry(
 export interface RouteQuoteInput {
   readonly livemode: boolean;
   readonly deposit: Deposit;
-  readonly status: { status: string; quoteResponse: OneClickQuoteResponse };
+  readonly status: { status: string; quoteResponse: OneClickStatusQuoteResponse };
   readonly signatureValid: boolean;
   readonly registry: readonly RegistryRow[];
   readonly treasury: string | null;

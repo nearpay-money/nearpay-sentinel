@@ -38,6 +38,7 @@ import { deadLetters, sentinelHandlers } from "../consumers/handlers.js";
 import { type EvmReader, evmReader, type NearReader, nearReader } from "../infra/clients/chains.js";
 import { oneClickStatus, type SandboxStatus, type StatusProvider, sandboxStatus } from "../infra/clients/providers.js";
 import { railsClient } from "../infra/clients/rails.js";
+import { oneClickTokens, sandboxTokenRegistry, type TokenRegistry } from "../infra/clients/tokens.js";
 import { MIGRATIONS_DIR } from "../infra/db/migrations.js";
 import type { DB, RegistryDB } from "../infra/db/schema.js";
 import { killSwitchState } from "../kill-switch/kill-switch.js";
@@ -61,6 +62,8 @@ export interface ServiceDeps {
   serviceToken?: () => Promise<string>;
   live?: StatusProvider | null;
   test?: SandboxStatus | null;
+  liveTokens?: TokenRegistry | null;
+  testTokens?: TokenRegistry | null;
   rails?: RailsClient;
   cache?: AttestationCache;
   near?: NearReader | null;
@@ -128,6 +131,16 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
               serviceToken,
               ...f,
             })
+          : null,
+    liveTokens:
+      deps.liveTokens !== undefined
+        ? deps.liveTokens
+        : oneClickTokens({ baseUrl: config.oneclickBaseUrl, apiKey: config.oneclickApiKey, ...f }),
+    testTokens:
+      deps.testTokens !== undefined
+        ? deps.testTokens
+        : config.sandboxBaseUrl
+          ? sandboxTokenRegistry({ baseUrl: config.sandboxBaseUrl, serviceToken, ...f })
           : null,
     rails: deps.rails ?? railsClient({ baseUrl: config.railsUrl, serviceToken, ...f }),
     cache: deps.cache ?? attestationCache(config.valkeyUrl),

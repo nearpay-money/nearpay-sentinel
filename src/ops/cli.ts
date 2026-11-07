@@ -1,21 +1,22 @@
 /**
- * Stage 1 ops CLI (platform §3, lld/sentinel.md §14): `docker compose exec sentinel-api /nodejs/bin/node
+ * Stage 1 ops CLI (platform §3, lld/sentinel.md §15): `docker compose exec sentinel-api /nodejs/bin/node
  * dist/ops.js <command>`. Every command prints one JSON document; errors print `{"error": …}` and exit 1
  * (2: usage). Kill-switch changes are recorded in `kill_switch_log` with the operator (`cli@<host>`) and
- * emitted like any other change; the two-person release arrives with the Stage 2 console.
+ * emitted like any other change. From Stage 2 the single-person release is refused when `NP_ENV=server`
+ * (`two_person_required`: the console's two-person release is the only one there) and stays on local/test.
  */
 import { parseArgs } from "node:util";
 import { sql } from "@nearpay-internal/db";
 import { fromUuid, isId, toUuid } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import type { Sentinel } from "../app/context.js";
-import { killSwitchState, setKillSwitch } from "../kill-switch/kill-switch.js";
+import { killSwitchState, setKillSwitch, setKillSwitchSinglePerson } from "../kill-switch/kill-switch.js";
 
 export const USAGE = `usage: ops.js <command> [arguments]
 
   kill-switch                               the kill switch and its last 20 changes
   kill-switch-engage <reason…>              stop live quoting now
-  kill-switch-release <reason…>             resume live quoting (Stage 1: one operator, logged)
+  kill-switch-release <reason…>             resume live quoting (one operator; local/test stacks only)
   findings [--all] [--limit N]              open (unacknowledged, non-pass) audit findings; --all: every finding
   finding-ack <fnd_…> <note…>               acknowledge a finding
   attestations <pa_… | deposit key | deposit address> [--limit N]   co-signing records, newest first`;
@@ -82,6 +83,7 @@ const findingView = (f: {
   created_at: Date;
   acknowledged_at: Date | null;
   acknowledged_by: string | null;
+  acknowledgement_note: string | null;
 }) => ({
   id: fromUuid("fnd", f.id),
   execution_id: f.execution_id,
@@ -93,6 +95,7 @@ const findingView = (f: {
   created_at: f.created_at,
   acknowledged_at: f.acknowledged_at,
   acknowledged_by: f.acknowledged_by,
+  acknowledgement_note: f.acknowledgement_note,
 });
 
 async function run(
@@ -113,7 +116,7 @@ async function run(
     case "kill-switch-engage":
       return setKillSwitch(s, true, reasonOf(args), actor);
     case "kill-switch-release":
-      return setKillSwitch(s, false, reasonOf(args), actor);
+      return setKillSwitchSinglePerson(s, false, reasonOf(args), actor);
     case "findings": {
       let q = s.db.selectFrom("audit_findings").selectAll().orderBy("created_at", "desc").limit(limitOf(o.limit));
       if (!o.all) q = q.where("result", "<>", "pass").where("acknowledged_at", "is", null);
@@ -122,12 +125,16 @@ async function run(
     case "finding-ack": {
       const [ref, ...note] = args;
       if (!ref || !isId("fnd", ref)) throw new UsageError("finding-ack needs a fnd_… id");
-      const who = `${actor}: ${reasonOf(note)}`.slice(0, 500);
       const row = await s.db
         .updateTable("audit_findings")
-        .set({ acknowledged_at: new Date(), acknowledged_by: who })
+        .set({
+          acknowledged_at: new Date(),
+          acknowledged_by: actor.slice(0, 200),
+          acknowledgement_note: reasonOf(note),
+        })
         .where("id", "=", toUuid(ref, "fnd"))
         .where("acknowledged_at", "is", null)
+        .where("result", "<>", "pass")
         .returningAll()
         .executeTakeFirst();
       if (!row) {
@@ -137,7 +144,7 @@ async function run(
           .where("id", "=", toUuid(ref, "fnd"))
           .executeTakeFirst();
         if (!exists) throw ApiError.missing("audit_finding", ref);
-        throw new ApiError("state_conflict", { message: "The finding is already acknowledged." });
+        throw new ApiError("state_conflict", { message: "The finding is already acknowledged or passed." });
       }
       s.log.warn({ finding: ref, actor }, "audit finding acknowledged");
       return findingView(row);

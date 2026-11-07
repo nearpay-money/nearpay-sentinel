@@ -14,8 +14,8 @@ import { NO_RETIREMENT } from "../../src/app/services.js";
 import { resetSpoofCounters } from "../../src/co-signer/attest.js";
 import { verifyAttestation } from "../../src/co-signer/crypto.js";
 import { killSwitchState } from "../../src/kill-switch/kill-switch.js";
-import { type FakeOneClick, fakeOneClick, PROVIDER_FEE_ACCOUNT } from "../support/fakes.js";
-import { KID, LIVE_TREASURY, type Stack, startStack } from "../support/stack.js";
+import { FAKE_TOKENS, type FakeOneClick, fakeOneClick, PROVIDER_FEE_ACCOUNT } from "../support/fakes.js";
+import { KID, LIVE_TREASURY, OPS_CLI_OPERATOR, type Stack, startStack } from "../support/stack.js";
 
 const USDC_NEAR = "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1";
 const USDC_BASE = "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near";
@@ -108,6 +108,8 @@ describe("signing", () => {
         chain: "near:mainnet",
         fingerprint: destinationFingerprint("near:mainnet", RECIPIENT, USDC_NEAR),
       },
+      // CR-15-07: the origin asset, display data from sentinel's own read of 1Click's token registry
+      asset: { asset_id: USDC_BASE, symbol: "USDC", decimals: 6 },
       expires_at: q.quote.deadline,
     });
     expect(Date.parse(signed.attestation.issued_at) % 1000).toBe(0);
@@ -181,6 +183,46 @@ describe("ticket gate (before any provider call)", () => {
     const r = await attest(noDeposit);
     expect(r.status).toBe(400);
     expect(r.body).toMatchObject({ error: { code: "invalid_request" } });
+  });
+});
+
+describe("attested asset (CR-15-07)", () => {
+  const USDC_ARB = "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near";
+  const quoteFor = (asset: string) => oc.quote({ request: { appFees: fees(), originAsset: asset } });
+
+  it("refuses (503, never the kill switch) when the registry's decimals do not explain the signed amountInFormatted", async () => {
+    oc.tokens = [...FAKE_TOKENS, { ...FAKE_TOKENS[0], assetId: USDC_ARB, blockchain: "arb", decimals: 18 }];
+    const q = quoteFor(USDC_ARB);
+    s.issued.set(q.quote.depositAddress as string, { livemode: true });
+    const b = body(q, { deposit: { origin_asset_id: USDC_ARB, chain: "eip155:42161" } });
+    const r = await attest(b);
+    expect(r.status).toBe(503);
+    expect(r.body).toMatchObject({ error: { code: "attestation_unavailable" } });
+    expect((await rows(b.attempt_id))[0]?.reasons[0]).toMatch(/^asset: registry decimals 18 do not explain/);
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
+  });
+
+  it("refuses an asset the registry does not list", async () => {
+    const other = "nep141:arb-0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9.omft.near";
+    const q = quoteFor(other);
+    const b = body(q, { deposit: { origin_asset_id: other, chain: "eip155:42161" } });
+    const r = await attest(b);
+    expect(r.status).toBe(503);
+    expect((await rows(b.attempt_id))[0]?.reasons[0]).toMatch(/not in the provider's token registry/);
+  });
+
+  it("refuses when the token registry cannot be read and nothing is cached", async () => {
+    oc.tokens = null;
+    const fresh = await s.extraApi({}); // a new process: empty token cache
+    try {
+      const q = oc.quote({ request: { appFees: fees() } });
+      const r = await fresh.call("POST", PATH, { body: body(q) });
+      expect(r.status).toBe(503);
+      expect(r.body).toMatchObject({ error: { code: "attestation_unavailable" } });
+    } finally {
+      oc.tokens = FAKE_TOKENS;
+      await fresh.stop();
+    }
   });
 });
 
@@ -357,7 +399,7 @@ describe("keys and the ops kill switch", () => {
     const token = await s.opsToken();
     const on = await s.call("POST", "/internal/kill-switch", { token, body: { engaged: true, reason: "drill" } });
     expect(on.status).toBe(200);
-    expect(on.body).toMatchObject({ engaged: true, reason: "drill", actor: "ops:ops-alice" });
+    expect(on.body).toMatchObject({ engaged: true, reason: "drill", actor: `ops:${OPS_CLI_OPERATOR}` });
     const v = (await killSwitchState(s.sentinel)).version;
     // idempotent: already engaged → no new version
     expect(
@@ -371,7 +413,7 @@ describe("keys and the ops kill switch", () => {
       token: await s.opsToken(),
       body: { engaged: false, reason: "drill over" },
     });
-    expect(off.body).toMatchObject({ engaged: false, actor: "ops:ops-alice" });
+    expect(off.body).toMatchObject({ engaged: false, actor: `ops:${OPS_CLI_OPERATOR}` });
     const log = await s.admin.db
       .selectFrom("kill_switch_log")
       .selectAll()
@@ -379,8 +421,8 @@ describe("keys and the ops kill switch", () => {
       .limit(2)
       .execute();
     expect(log.map((l) => [l.engaged, l.actor])).toEqual([
-      [false, "ops:ops-alice"],
-      [true, "ops:ops-alice"],
+      [false, `ops:${OPS_CLI_OPERATOR}`],
+      [true, `ops:${OPS_CLI_OPERATOR}`],
     ]);
     await expect(sql`delete from kill_switch_log`.execute(s.admin.db)).rejects.toThrow(/append-only/);
   });

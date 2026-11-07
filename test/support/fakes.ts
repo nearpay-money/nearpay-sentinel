@@ -87,7 +87,31 @@ export interface FakeOneClick extends FakeServer {
   readonly statuses: Map<string, FakeStatus>;
   /** Next status calls fail with this HTTP status (unavailability tests). */
   failNext: number;
+  /** `GET /v0/tokens` body (the recorded quote's assets by default); `null` → 503. */
+  tokens: unknown[] | null;
 }
+
+/** USDC on Base (the recorded quote's origin asset) and USDC on NEAR (its destination). */
+export const FAKE_TOKENS = [
+  {
+    assetId: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near",
+    decimals: 6,
+    blockchain: "base",
+    symbol: "USDC",
+    price: 1,
+    priceUpdatedAt: "2026-11-07T00:00:00.000Z",
+    contractAddress: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+  },
+  {
+    assetId: "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+    decimals: 6,
+    blockchain: "near",
+    symbol: "USDC",
+    price: 1,
+    priceUpdatedAt: "2026-11-07T00:00:00.000Z",
+    contractAddress: null,
+  },
+];
 
 export async function fakeOneClick(): Promise<FakeOneClick> {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
@@ -95,8 +119,10 @@ export async function fakeOneClick(): Promise<FakeOneClick> {
   const statuses = new Map<string, FakeStatus>();
   const quotes = new Map<string, OneClickQuoteResponse>();
   // the handler reads the control from the returned object itself (set by the tests)
-  let ctl: { failNext: number } = { failNext: 0 };
+  let ctl: { failNext: number; tokens: unknown[] | null } = { failNext: 0, tokens: FAKE_TOKENS };
   const server = await fakeServer((req) => {
+    if (req.path === "/v0/tokens")
+      return ctl.tokens ? { status: 200, body: ctl.tokens } : { status: 503, body: { message: "unavailable" } };
     if (req.path !== "/v0/status") return { status: 404, body: { message: "not found" } };
     if (ctl.failNext > 0) {
       ctl.failNext--;
@@ -127,6 +153,7 @@ export async function fakeOneClick(): Promise<FakeOneClick> {
     managerPublicKey: `ed25519:${bs58.encode(raw)}`,
     statuses,
     failNext: 0,
+    tokens: FAKE_TOKENS,
     quote(o: Parameters<FakeOneClick["quote"]>[0]) {
       const base = fixture<OneClickQuoteResponse>("oneclick/dry-quote.json");
       const address = `0x${randomBytes(20).toString("hex")}`;

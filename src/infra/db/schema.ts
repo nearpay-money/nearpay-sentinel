@@ -1,4 +1,4 @@
-/** Kysely table types (migrations/0001_sentinel.sql) and identity's registry view (read-only role). */
+/** Kysely table types (migrations/0001_sentinel.sql, 0002_two_person_release.sql) and identity's registry view (read-only role). */
 import type { ColumnType, KitTables } from "@nearpay-internal/db";
 
 type Timestamp = ColumnType<Date, Date | string | undefined, Date | string>;
@@ -40,6 +40,7 @@ export interface AuditFindingsTable {
   created_at: Timestamp;
   acknowledged_at: Opt<Date>;
   acknowledged_by: Opt<string>;
+  acknowledgement_note: Opt<string>;
 }
 
 export interface KillSwitchTable {
@@ -60,11 +61,28 @@ export interface KillSwitchLogTable {
   created_at: Timestamp;
 }
 
+/** A two-person release request (`OpsApproval`, `opa_`); operator ids are `usr_` uuids. */
+export interface ReleaseRequestsTable {
+  id: string;
+  reason: string;
+  status: "pending" | "approved" | "rejected" | "expired";
+  requested_by: string;
+  requested_role: "ops" | "ops_admin";
+  requested_at: Timestamp;
+  decided_by: Opt<string>;
+  decided_role: Opt<"ops" | "ops_admin">;
+  decided_at: Opt<Date>;
+  decision_note: Opt<string>;
+  expires_at: ColumnType<Date, Date | string, Date | string>;
+  switch_version: number;
+}
+
 export interface SentinelTables {
   attestations: AttestationsTable;
   audit_findings: AuditFindingsTable;
   kill_switch: KillSwitchTable;
   kill_switch_log: KillSwitchLogTable;
+  release_requests: ReleaseRequestsTable;
 }
 
 export type DB = SentinelTables & KitTables;

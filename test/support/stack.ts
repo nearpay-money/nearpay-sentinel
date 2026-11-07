@@ -18,8 +18,8 @@ import {
   type EventProbe,
   eventProbe,
   type MockPeer,
+  mintOpsToken,
   mintServiceToken,
-  mintTestToken,
   mockPeer,
   provisionServiceDatabase,
   type Started,
@@ -45,6 +45,8 @@ export const SANDBOX_IMAGE = process.env.NP_SANDBOX_IMAGE ?? "nearpay/sandbox:lo
 export const TREASURY = "treasury.nearpay.near";
 export const LIVE_TREASURY = "intents.near"; // the recorded quote's appFee recipient
 export const KID = "sent-it-1";
+/** Operator of `opsToken()` (a console operator calling `POST /internal/kill-switch`). */
+export const OPS_CLI_OPERATOR = "usr_01m6vree6ye928jvj2vxkyyz08";
 
 async function freePort(): Promise<number> {
   const s = createServer();
@@ -196,6 +198,16 @@ export interface Stack {
     o?: { body?: unknown; token?: string | null; headers?: Record<string, string> },
   ): Promise<{ status: number; body: unknown; headers: Headers }>;
   opsToken(scopes?: string[]): Promise<string>;
+  /** A console operator token (`ptype=ops`, `sub` = `usr_…`, `ops_role`; step-up fresh unless `stepUp: false`). */
+  operatorToken(o: {
+    sub: string;
+    role?: "ops" | "ops_admin";
+    stepUp?: boolean;
+    stepUpUntil?: number;
+    scopes?: string[];
+  }): Promise<string>;
+  /** Another api process on the same databases with a config override (e.g. `env: "server"`). */
+  extraApi(over: Partial<WorkerConfig>): Promise<{ call: Stack["call"]; stop(): Promise<void> }>;
   publishEvent(e: Envelope): Promise<void>;
   probe(filter?: string): Promise<EventProbe>;
   stop(): Promise<void>;
@@ -386,7 +398,40 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
       const text = await res.text();
       return { status: res.status, body: text ? JSON.parse(text) : undefined, headers: res.headers };
     },
-    opsToken: (scopes = ["sentinel.killswitch"]) => mintTestToken({ sub: "ops-alice", ptype: "ops", scp: scopes }),
+    opsToken: (scopes = ["sentinel.killswitch"]) => mintOpsToken({ sub: OPS_CLI_OPERATOR, role: "ops", scopes }),
+    operatorToken: (t) =>
+      mintOpsToken({
+        sub: t.sub,
+        role: t.role ?? "ops",
+        ...(t.scopes ? { scopes: t.scopes } : {}),
+        stepUp: t.stepUp === false ? false : t.stepUpUntil ? t.stepUpUntil - Math.floor(Date.now() / 1000) : true,
+      }),
+    async extraApi(over) {
+      const { service } = createApi({ ...config, ...over } as WorkerConfig, {
+        ...deps,
+        database: createDb<DB>({ url: appUrl, applicationName: "sentinel-api-extra" }),
+        registry: createDb<RegistryDB>({ url: config.registryDbUrl, applicationName: "sentinel-api-extra" }),
+        cache: attestationCache(undefined),
+      });
+      const { port: p } = await service.start();
+      const base = `http://127.0.0.1:${p}`;
+      return {
+        async call(method, path, c = {}) {
+          const res = await fetch(`${base}${path}`, {
+            method,
+            headers: {
+              ...(c.token ? { "x-nearpay-token": c.token } : {}),
+              ...(c.body !== undefined ? { "content-type": "application/json" } : {}),
+              ...c.headers,
+            },
+            body: c.body === undefined ? undefined : JSON.stringify(c.body),
+          });
+          const text = await res.text();
+          return { status: res.status, body: text ? JSON.parse(text) : undefined, headers: res.headers };
+        },
+        stop: () => service.stop(),
+      };
+    },
     async publishEvent(e) {
       if (!bus) throw new Error("no bus (start the stack with a worker)");
       await publish(bus, e.subject, e, e.id);

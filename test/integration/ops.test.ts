@@ -39,7 +39,7 @@ async function finding(result: "pass" | "mismatch" | "unverifiable") {
 }
 
 describe("ops CLI", () => {
-  it("engages, shows and releases the kill switch; every change is logged and emitted", async () => {
+  it("engages, shows and releases the kill switch (one operator on local/test stacks); every change is logged and emitted", async () => {
     const on = await ops("kill-switch-engage", "integrity", "drill");
     expect(on.code).toBe(0);
     expect(on.json).toMatchObject({ engaged: true, reason: "integrity drill", actor: "cli@test" });
@@ -76,11 +76,12 @@ describe("ops CLI", () => {
     expect(list.json.map((f: { id: string }) => f.id)).toContain(open);
     expect(list.json.map((f: { id: string }) => f.id)).not.toContain(passed);
     const ack = await ops("finding-ack", open, "checked", "on", "chain");
-    expect(ack.json).toMatchObject({ id: open, acknowledged_by: "cli@test: checked on chain" });
+    expect(ack.json).toMatchObject({ id: open, acknowledged_by: "cli@test", acknowledgement_note: "checked on chain" });
     expect((await ops("findings")).json.map((f: { id: string }) => f.id)).not.toContain(open);
     expect((await ops("findings", "--all", "--limit", "10")).json.map((f: { id: string }) => f.id)).toEqual(
       expect.arrayContaining([open, passed]),
     );
+    expect((await ops("finding-ack", passed, "nothing to do")).err).toMatch(/state_conflict/);
     const again = await ops("finding-ack", open, "again");
     expect(again.code).toBe(1);
     expect(again.err).toMatch(/state_conflict/);
