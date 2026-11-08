@@ -144,3 +144,69 @@ export function nearReader(o: {
     },
   };
 }
+
+/** Solana JSON-RPC (§16: own provider accounts, 3 s, one retry). */
+export interface SolanaReader {
+  /** `getTransaction` at `finalized` (jsonParsed); null when not found or not finalized yet. */
+  transaction(signature: string): Promise<unknown | null>;
+}
+
+export function solanaReader(o: { urls: readonly string[]; fetch?: typeof fetch; timeoutMs?: number }): SolanaReader {
+  const f = o.fetch ?? fetch;
+  // one retry on a single-URL pool; otherwise each URL once
+  const urls = o.urls.length === 1 ? [o.urls[0] as string, o.urls[0] as string] : o.urls;
+  return {
+    async transaction(signature) {
+      const body = (await rpcCall(
+        f,
+        urls,
+        "getTransaction",
+        [signature, { commitment: "finalized", maxSupportedTransactionVersion: 0, encoding: "jsonParsed" }],
+        o.timeoutMs ?? 3_000,
+      )) as { result?: unknown; error?: { message?: string } };
+      if (body.error) throw new ChainUnavailable(`getTransaction: ${body.error.message ?? "rpc error"}`);
+      return body.result ?? null;
+    },
+  };
+}
+
+/** Bitcoin Esplora REST (§16: own provider accounts, 5 s, one retry). */
+export interface EsploraReader {
+  /** `GET /tx/{txid}` (null on 404) with the tip height from `GET /blocks/tip/height`, read from the same server. */
+  tx(txid: string): Promise<{ tx: unknown; tipHeight: number } | null>;
+}
+
+export function esploraReader(o: { urls: readonly string[]; fetch?: typeof fetch; timeoutMs?: number }): EsploraReader {
+  const f = o.fetch ?? fetch;
+  const t = o.timeoutMs ?? 5_000;
+  const urls = o.urls.length === 1 ? [o.urls[0] as string, o.urls[0] as string] : o.urls;
+  const get = async (base: string, path: string) =>
+    f(`${base.replace(/\/+$/, "")}${path}`, { signal: AbortSignal.timeout(t), headers: { accept: "*/*" } });
+  return {
+    async tx(txid) {
+      if (!/^[0-9a-f]{64}$/.test(txid)) return null;
+      let last = "no Esplora configured";
+      for (const base of urls) {
+        try {
+          const res = await get(base, `/tx/${txid}`);
+          if (res.status === 404) return null;
+          if (!res.ok) {
+            last = `${base} responded ${res.status}`;
+            continue;
+          }
+          const tx = await res.json();
+          const tip = await get(base, "/blocks/tip/height");
+          const text = tip.ok ? (await tip.text()).trim() : "";
+          if (!/^\d+$/.test(text)) {
+            last = `${base} tip height unreadable`;
+            continue;
+          }
+          return { tx, tipHeight: Number(text) };
+        } catch (e) {
+          last = `${base}: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+      throw new ChainUnavailable(last);
+    },
+  };
+}

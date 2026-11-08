@@ -81,6 +81,16 @@ const shared = {
   sentinelEvmRpcUrls_1: ownRpcList(),
   sentinelEvmRpcUrls_8453: ownRpcList(),
   sentinelEvmRpcUrls_42161: ownRpcList(),
+  /**
+   * Stage 4 (§16): Solana RPC and Bitcoin Esplora for settlement audits. No public default — rails'
+   * shared pools (`NP_SOLANA_RPC_URLS`, `NP_BITCOIN_ESPLORA_URLS`) or sentinel's own provider accounts
+   * (`NP_SENTINEL_SOLANA_RPC_URLS_FILE`, `NP_SENTINEL_BITCOIN_ESPLORA_URLS_FILE`, precedence). Unset →
+   * audits on that chain record `unverifiable` and alert `audit_coverage_missing{chain}`.
+   */
+  solanaRpcUrls: rpcList().optional(),
+  bitcoinEsploraUrls: rpcList().optional(),
+  sentinelSolanaRpcUrls: ownRpcList(),
+  sentinelBitcoinEsploraUrls: ownRpcList(),
 };
 
 export const apiShape = { ...shared };
@@ -115,4 +125,14 @@ export function evmRpcUrls(c: SharedConfig): Record<string, readonly string[]> {
     "eip155:8453": pick(c.sentinelEvmRpcUrls_8453, c.evmRpcUrls_8453),
     "eip155:42161": pick(c.sentinelEvmRpcUrls_42161, c.evmRpcUrls_42161),
   };
+}
+
+/** Sentinel's Solana RPC pool (own accounts first); empty = no coverage (§16). */
+export function solanaRpcUrls(c: SharedConfig): readonly string[] {
+  return c.sentinelSolanaRpcUrls?.length ? c.sentinelSolanaRpcUrls : (c.solanaRpcUrls ?? []);
+}
+
+/** Sentinel's Bitcoin Esplora pool (own accounts first); empty = no coverage (§16). */
+export function bitcoinEsploraUrls(c: SharedConfig): readonly string[] {
+  return c.sentinelBitcoinEsploraUrls?.length ? c.sentinelBitcoinEsploraUrls : (c.bitcoinEsploraUrls ?? []);
 }

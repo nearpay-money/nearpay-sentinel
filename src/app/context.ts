@@ -6,7 +6,7 @@ import type { Logger, ServiceMetrics } from "@nearpay-internal/service";
 import { Redis } from "ioredis";
 import type { ProviderSplit } from "../address-integrity/checks.js";
 import type { SigningKey } from "../co-signer/crypto.js";
-import type { EvmReader, NearReader } from "../infra/clients/chains.js";
+import type { EsploraReader, EvmReader, NearReader, SolanaReader } from "../infra/clients/chains.js";
 import type { SandboxStatus, StatusProvider } from "../infra/clients/providers.js";
 import type { TokenRegistry } from "../infra/clients/tokens.js";
 import type { DB, RegistryDB } from "../infra/db/schema.js";
@@ -17,9 +17,11 @@ export interface SentinelMetrics {
   attestation(kind: string, result: string, reason: string, seconds: number): void;
   finding(result: string): void;
   killSwitch(engaged: boolean): void;
+  /** An audit on a Stage 4 chain had no sentinel reader configured (§16 `audit_coverage_missing{chain}`). */
+  coverageMissing(chain: string): void;
 }
 
-export const noMetrics: SentinelMetrics = { attestation() {}, finding() {}, killSwitch() {} };
+export const noMetrics: SentinelMetrics = { attestation() {}, finding() {}, killSwitch() {}, coverageMissing() {} };
 
 /** Service metrics (§12). The kill-switch gauge is read from the database on every scrape. */
 export function sentinelMetrics(m: ServiceMetrics, engaged?: () => Promise<boolean>): SentinelMetrics {
@@ -31,6 +33,11 @@ export function sentinelMetrics(m: ServiceMetrics, engaged?: () => Promise<boole
     [0.01, 0.05, 0.1, 0.25, 0.5, 1, 1.5, 3],
   );
   const findings = m.counter("audit_findings_total", "Independent re-verification results.", ["result"]);
+  const coverage = m.counter(
+    "audit_coverage_missing",
+    "Audits that found no sentinel chain reader configured for the settlement chain (alert).",
+    ["chain"],
+  );
   const ks = m.gauge(
     "kill_switch_engaged",
     "1 while live quoting is stopped.",
@@ -48,6 +55,7 @@ export function sentinelMetrics(m: ServiceMetrics, engaged?: () => Promise<boole
     },
     finding: (result) => findings.inc({ result }),
     killSwitch: (on) => ks.set(on ? 1 : 0),
+    coverageMissing: (chain) => coverage.inc({ chain }),
   };
 }
 
@@ -134,6 +142,9 @@ export interface Sentinel {
   readonly intentsContract: string;
   readonly near: NearReader | null;
   readonly evm: ReadonlyMap<string, EvmReader>;
+  /** Stage 4 (§16): sentinel's own Solana / Bitcoin readers; null = not configured (audits unverifiable). */
+  readonly solana: SolanaReader | null;
+  readonly bitcoin: EsploraReader | null;
   readonly auditSampleRate: number;
   readonly auditAlwaysUsdMicros: bigint;
   readonly random: () => number;

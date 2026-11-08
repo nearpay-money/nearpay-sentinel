@@ -9,6 +9,7 @@ export default defineConfig({
       include: [
         "src/address-integrity/**/*.ts",
         "src/independent-reconciliation/audit.ts",
+        "src/independent-reconciliation/chain-reads.ts",
         "src/co-signer/crypto.ts",
         "src/kill-switch/two-person.ts",
         "src/co-signer/attestation.ts",

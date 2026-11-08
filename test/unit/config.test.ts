@@ -4,7 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "@nearpay-internal/service";
 import { describe, expect, it } from "vitest";
-import { apiShape, evmRpcUrls, nearRpcUrls, readApiConfig, workerShape } from "../../src/config.js";
+import {
+  apiShape,
+  bitcoinEsploraUrls,
+  evmRpcUrls,
+  nearRpcUrls,
+  readApiConfig,
+  solanaRpcUrls,
+  workerShape,
+} from "../../src/config.js";
 
 const files: Record<string, string> = {
   "/s/db": "postgres://sentinel_app:x@postgres:5432/sentinel",
@@ -12,8 +20,11 @@ const files: Record<string, string> = {
   "/s/client": "secret",
   "/s/key": "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----",
   "/s/near": "https://near.example/key1, https://near2.example/key2",
+  "/s/solana": "https://sol.example/key1",
+  "/s/esplora": "https://esplora.example/key1/api",
 };
 const env = {
+  NP_ENV: "test",
   NP_DB_URL_FILE: "/s/db",
   NP_REGISTRY_DB_URL_FILE: "/s/registry",
   NP_IDENTITY_URL: "http://identity-api:8080",
@@ -76,6 +87,33 @@ describe("config", () => {
   it("prefers sentinel's own RPC accounts (secret files) over the shared pools", () => {
     const c = loadConfig(apiShape, { env: { ...env, NP_SENTINEL_NEAR_RPC_URLS_FILE: "/s/near" }, readFile: read });
     expect(nearRpcUrls(c)).toEqual(["https://near.example/key1", "https://near2.example/key2"]);
+  });
+
+  it("Stage 4: Solana / Bitcoin readers have no public default; own accounts take precedence over rails' pools", () => {
+    const none = loadConfig(apiShape, { env, readFile: read });
+    expect([solanaRpcUrls(none), bitcoinEsploraUrls(none)]).toEqual([[], []]);
+    const shared = loadConfig(apiShape, {
+      env: { ...env, NP_SOLANA_RPC_URLS: "https://sol.shared", NP_BITCOIN_ESPLORA_URLS: "https://esplora.shared/api" },
+      readFile: read,
+    });
+    expect([solanaRpcUrls(shared), bitcoinEsploraUrls(shared)]).toEqual([
+      ["https://sol.shared"],
+      ["https://esplora.shared/api"],
+    ]);
+    const own = loadConfig(apiShape, {
+      env: {
+        ...env,
+        NP_SOLANA_RPC_URLS: "https://sol.shared",
+        NP_BITCOIN_ESPLORA_URLS: "https://esplora.shared/api",
+        NP_SENTINEL_SOLANA_RPC_URLS_FILE: "/s/solana",
+        NP_SENTINEL_BITCOIN_ESPLORA_URLS_FILE: "/s/esplora",
+      },
+      readFile: read,
+    });
+    expect([solanaRpcUrls(own), bitcoinEsploraUrls(own)]).toEqual([
+      ["https://sol.example/key1"],
+      ["https://esplora.example/key1/api"],
+    ]);
   });
 
   it.each([

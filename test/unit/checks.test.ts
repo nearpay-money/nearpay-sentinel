@@ -425,7 +425,11 @@ describe("asset ids", () => {
     ["nep141:eth.omft.near", { kind: "native", chain: "eip155:1" }],
     [
       "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
-      { kind: "bridged", chain: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp" },
+      {
+        kind: "spl",
+        chain: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        hash20: "5ce3bf3a31af18be40ba30f721101b4341690186",
+      },
     ],
     ["nep141:btc.omft.near", { kind: "native", chain: "bip122:000000000019d6689c085ae165831e93" }],
     ["nep141:zzz.omft.near", { kind: "native", chain: null }],

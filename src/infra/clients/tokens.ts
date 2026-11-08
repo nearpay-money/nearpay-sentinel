@@ -29,7 +29,19 @@ export const TOKENS_MISS_REFRESH_MS = 30_000;
 const Entry = OneClickToken.pick({ assetId: true, symbol: true, decimals: true }).extend({
   blockchain: z.string().nullish(),
   contractAddress: z.string().nullish(),
+  price: z.unknown().optional(),
 });
+
+/**
+ * The registry's USD price as an exact decimal string (Stage 4: only the Bitcoin confirmation tier of an
+ * audit uses it, §16). A price that is not a plain positive decimal (absent, zero, negative, exponent
+ * notation) is null: the auditor then requires the stricter tier.
+ */
+export function priceString(price: unknown): string | null {
+  if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) return null;
+  const s = String(price);
+  return /^\d+(\.\d+)?$/.test(s) ? s : null;
+}
 
 /** Builds the asset map from a token list body; entries that do not parse are left out (and so refused). */
 export function tokenMap(body: unknown): Map<string, AssetDisplay> {
@@ -42,6 +54,7 @@ export function tokenMap(body: unknown): Map<string, AssetDisplay> {
         symbol: e.data.symbol,
         decimals: e.data.decimals,
         token: registryTokenContract(e.data.blockchain, e.data.contractAddress),
+        priceUsd: priceString(e.data.price),
       });
   }
   return map;
