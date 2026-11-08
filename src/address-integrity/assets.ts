@@ -57,11 +57,78 @@ export function assetChain(assetId: string): string | null {
 export interface AssetDisplay {
   readonly symbol: string;
   readonly decimals: number;
+  /**
+   * How to transfer the asset on its chain (spec 0.2.1 `Attestation.asset.token`), from the same registry
+   * entry: its `blockchain` family and `contractAddress`. Null / absent when the entry does not say.
+   */
+  readonly token?: TokenContractView | null;
+}
+
+/** Spec `TokenContract` (wallet path). */
+export interface TokenContractView {
+  readonly standard: "erc20" | "native" | "nep141" | "spl" | "other";
+  readonly address: string | null;
 }
 
 export type AttestedAsset =
-  | { readonly ok: true; readonly asset: { asset_id: string; symbol: string; decimals: number } }
+  | {
+      readonly ok: true;
+      readonly asset: { asset_id: string; symbol: string; decimals: number; token: TokenContractView | null };
+    }
   | { readonly ok: false; readonly reason: string };
+
+/**
+ * The token contract of a registry entry (spec 0.2.1): by the chain family of its 1Click `blockchain` code —
+ * EVM `erc20`, NEAR `nep141`, Solana `spl` with a contract, `native` without one; Bitcoin `native`; any other
+ * family `other`. An entry without a `blockchain` code (or with an unknown one) has no token (null: the
+ * manual path). Addresses are kept as listed (EVM lowercased), at most 256 characters.
+ */
+export function registryTokenContract(
+  blockchain: string | null | undefined,
+  contractAddress: string | null | undefined,
+): TokenContractView | null {
+  if (!blockchain) return null;
+  const info = chainByBlockchain(blockchain);
+  if (!info) return null;
+  const raw = contractAddress?.trim() ?? "";
+  if (raw.length > 256) return null;
+  const address = raw.length > 0 ? raw : null;
+  switch (info.family) {
+    case "evm":
+      return address ? { standard: "erc20", address: address.toLowerCase() } : { standard: "native", address: null };
+    case "near":
+      return address ? { standard: "nep141", address } : { standard: "native", address: null };
+    case "solana":
+      return address ? { standard: "spl", address } : { standard: "native", address: null };
+    case "bitcoin":
+      return { standard: "native", address: null };
+    default:
+      return { standard: "other", address };
+  }
+}
+
+/**
+ * The registry's token contract checked against what the asset id itself says (defence in depth: a registry
+ * entry must never make the wallet path transfer a contract other than the one the Intents asset id names).
+ * An id naming an ERC-20 (`<chain>-0x….omft.near`) or a NEP-141 account (`nep141:<account>`) needs that
+ * contract: a different contract (or another standard) is a contradiction (refused); an entry that lists no
+ * contract for it (`native`) gives no token (null: the manual path — never "send the native coin"). An id
+ * naming the chain's native coin needs `native`. Ids that name no contract accept what the registry says.
+ */
+export function reconcileToken(
+  assetId: string,
+  token: TokenContractView | null,
+): { readonly ok: true; readonly token: TokenContractView | null } | { readonly ok: false } {
+  if (token === null) return { ok: true, token: null };
+  const shape = assetShape(assetId);
+  if (shape.kind === "erc20" || shape.kind === "nep141") {
+    if (token.standard === "native") return { ok: true, token: null };
+    const standard = shape.kind;
+    return token.standard === standard && token.address === shape.contract ? { ok: true, token } : { ok: false };
+  }
+  if (shape.kind === "native") return token.standard === "native" ? { ok: true, token } : { ok: false };
+  return { ok: true, token };
+}
 
 const DECIMAL = /^(\d+)(?:\.(\d+))?$/;
 
@@ -97,5 +164,12 @@ export function attestedAsset(
       ok: false,
       reason: `registry decimals ${decimals} do not explain the signed amountInFormatted ${signed.amountInFormatted.slice(0, 40)}`,
     };
-  return { ok: true, asset: { asset_id: assetId, symbol, decimals } };
+  const listed = display.token ?? null;
+  const token = reconcileToken(assetId, listed);
+  if (!token.ok)
+    return {
+      ok: false,
+      reason: `registry token contract ${listed?.standard}:${(listed?.address ?? "").slice(0, 80)} does not match ${assetId}`,
+    };
+  return { ok: true, asset: { asset_id: assetId, symbol, decimals, token: token.token } };
 }

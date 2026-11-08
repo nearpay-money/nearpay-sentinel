@@ -27,6 +27,21 @@ export async function killSwitchState(s: Pick<Sentinel, "db">): Promise<KillSwit
   return s.db.selectFrom("kill_switch").selectAll().where("id", "=", 1).executeTakeFirstOrThrow();
 }
 
+/**
+ * `KillSwitchState` on the wire (`getKillSwitch`, `setKillSwitch`): `version` is the row version, which
+ * equals the envelope `aggregate.version` of the latest `evt.sentinel.kill_switch.*` (spec 0.2.1), so a
+ * reader that seeds from it applies only later events.
+ */
+export function killSwitchView(st: KillSwitchState) {
+  return {
+    engaged: st.engaged,
+    reason: st.reason,
+    actor: st.actor,
+    updated_at: st.updated_at.toISOString(),
+    version: st.version,
+  };
+}
+
 /** Engages or releases. No-op (returns the state) when already in the requested position. */
 export async function setKillSwitch(
   s: Pick<Sentinel, "db" | "log" | "metrics">,

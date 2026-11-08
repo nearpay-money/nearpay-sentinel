@@ -1,4 +1,4 @@
-/** Kysely table types (migrations/0001_sentinel.sql, 0002_two_person_release.sql) and identity's registry view (read-only role). */
+/** Kysely table types (migrations/0001_sentinel.sql, 0002_two_person_release.sql, 0003_account_names.sql) and identity's registry view (read-only role). */
 import type { ColumnType, KitTables } from "@nearpay-internal/db";
 
 type Timestamp = ColumnType<Date, Date | string | undefined, Date | string>;
@@ -77,7 +77,16 @@ export interface ReleaseRequestsTable {
   switch_version: number;
 }
 
+/** Display names of accounts (spec 0.2.1), from `evt.identity.account.*`; stale versions are ignored. */
+export interface AccountNamesTable {
+  account_id: string;
+  display_name: string;
+  version: number;
+  updated_at: Timestamp;
+}
+
 export interface SentinelTables {
+  account_names: AccountNamesTable;
   attestations: AttestationsTable;
   audit_findings: AuditFindingsTable;
   kill_switch: KillSwitchTable;

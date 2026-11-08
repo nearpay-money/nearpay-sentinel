@@ -3,13 +3,16 @@
  * operator, no step-up), the two-person release (request → approve by a different ops_admin, fresh
  * step-ups, 1 h expiry, one pending request, engage in between expires it), the single-person release
  * refused on the server stage, and findings list/get/acknowledge — with the outbox rows (switch events,
- * `release_requested`, `ops_action.recorded`) written in the same transaction as each change.
+ * `release_requested`, `ops_action.recorded`) written in the same transaction as each change. Spec 0.2.1:
+ * the service-readable `getKillSwitch` (version = latest event aggregate version) and the findings'
+ * `account_display_name` from `evt.identity.account.*`.
  */
 
 import { sql } from "@nearpay-internal/db";
 import { fromUuid, newId, toUuid, uuidv7 } from "@nearpay-internal/ids";
-import { mintServiceToken, mintTestToken } from "@nearpay-internal/testing";
+import { account, domainEvent, mintServiceToken, mintTestToken } from "@nearpay-internal/testing";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { sentinelHandlers } from "../../src/consumers/handlers.js";
 import { runOps } from "../../src/ops/cli.js";
 import { type Stack, startStack } from "../support/stack.js";
 
@@ -514,5 +517,103 @@ describe("findings", () => {
     });
     expect(pass.status).toBe(409);
     expect((await outbox()).length).toBe(1);
+  });
+});
+
+describe("getKillSwitch (spec 0.2.1, service sentinel.read)", () => {
+  it("returns the row with version = the aggregate version of the latest kill-switch event; never cached", async () => {
+    const svc = async (who: "payments" | "rails" | "agentpay") =>
+      s.call("GET", "/internal/kill-switch", { token: await mintServiceToken(who) });
+    const before = await svc("rails");
+    expect(before.status).toBe(200);
+    const v0 = (before.body as { version: number }).version;
+    expect(before.body).toMatchObject({ engaged: false, version: expect.any(Number) });
+    await engage("integrity");
+    const ev = (await outbox()).filter((e) => e.subject === "evt.sentinel.kill_switch.engaged");
+    for (const who of ["payments", "rails", "agentpay"] as const) {
+      const r = await svc(who);
+      expect(r.status).toBe(200);
+      expect(r.body).toMatchObject({ engaged: true, reason: "integrity", version: v0 + 1 });
+      expect(typeof (r.body as { updated_at: string }).updated_at).toBe("string");
+    }
+    expect(ev.at(-1)?.payload.aggregate.version).toBe(v0 + 1);
+    // the single-person route answers with the version too
+    const off = await s.call("POST", "/internal/kill-switch", {
+      token: await s.opsToken(),
+      body: { engaged: false, reason: "drill over" },
+    });
+    expect(off.body).toMatchObject({ engaged: false, version: v0 + 2 });
+    expect((await svc("payments")).body).toMatchObject({ engaged: false, version: v0 + 2 });
+  });
+
+  it("needs sentinel.read: no token 401, a service without the scope or an ops token 403", async () => {
+    expect((await s.call("GET", "/internal/kill-switch")).status).toBe(401);
+    expect((await s.call("GET", "/internal/kill-switch", { token: await mintServiceToken("webhooks") })).status).toBe(
+      403,
+    );
+    expect((await s.call("GET", "/internal/kill-switch", { token: await tok(alice, "ops", false) })).status).toBe(403);
+  });
+});
+
+describe("account display names on findings (spec 0.2.1)", () => {
+  const handlers = () => sentinelHandlers(s.admin.db, { del: async () => {} } as never);
+  const accountEvent = (
+    subject: "evt.identity.account.created" | "evt.identity.account.updated",
+    acct: string,
+    name: string,
+    version: number,
+  ) =>
+    domainEvent(subject, account({ id: acct as `acct_${string}`, display_name: name }), {
+      version,
+      accountUuid: toUuid(acct, "acct"),
+      livemode: null,
+    }) as never;
+
+  it("created/updated fill the name; a stale or replayed event changes nothing; unknown accounts are null", async () => {
+    await s.admin.db.deleteFrom("audit_findings").execute();
+    const named = newId("acct");
+    const unknown = newId("acct");
+    const h = handlers();
+    await h["evt.identity.account.created"]?.(accountEvent("evt.identity.account.created", named, "Acme", 1));
+    await h["evt.identity.account.updated"]?.(accountEvent("evt.identity.account.updated", named, "Acme GmbH", 3));
+    await h["evt.identity.account.updated"]?.(accountEvent("evt.identity.account.updated", named, "Stale", 2));
+    const id1 = uuidv7();
+    const id2 = uuidv7();
+    for (const [id, account] of [
+      [id1, named],
+      [id2, unknown],
+    ] as const)
+      await s.admin.db
+        .insertInto("audit_findings")
+        .values({
+          id,
+          execution_id: newId("ex"),
+          account_id: toUuid(account, "acct"),
+          livemode: true,
+          check_kind: "settlement",
+          result: "mismatch",
+          details: JSON.stringify({}),
+        })
+        .execute();
+    const token = await tok(alice, "ops", false);
+    const list = (await s.call("GET", "/ops/findings", { token })).body as {
+      data: { id: string; account_display_name: string | null }[];
+    };
+    const byId = Object.fromEntries(list.data.map((d) => [d.id, d.account_display_name]));
+    expect(byId[fromUuid("fnd", id1)]).toBe("Acme GmbH");
+    expect(byId[fromUuid("fnd", id2)]).toBeNull();
+    const one = await s.call("GET", `/ops/findings/${fromUuid("fnd", id1)}`, { token });
+    expect(one.body).toMatchObject({ account_display_name: "Acme GmbH" });
+    const ack = await s.call("POST", `/ops/findings/${fromUuid("fnd", id1)}/acknowledge`, {
+      token,
+      body: { note: "seen" },
+    });
+    expect(ack.body).toMatchObject({ account_display_name: "Acme GmbH" });
+    const row = await s.admin.db
+      .selectFrom("account_names")
+      .selectAll()
+      .where("account_id", "=", toUuid(named, "acct"))
+      .executeTakeFirstOrThrow();
+    expect(row).toMatchObject({ display_name: "Acme GmbH", version: 3 });
   });
 });

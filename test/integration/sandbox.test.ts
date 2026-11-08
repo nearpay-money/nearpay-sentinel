@@ -168,7 +168,12 @@ describe("test mode against the sandbox", () => {
       livemode: false,
       destination: { asset_id: USDC_ARB, chain: "eip155:42161" },
       // display data from the sandbox's token registry, consistent with its signed amountInFormatted
-      asset: { asset_id: USDC_BASE, symbol: "USDC", decimals: 6 },
+      asset: {
+        asset_id: USDC_BASE,
+        symbol: "USDC",
+        decimals: 6,
+        token: { standard: "erc20", address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" },
+      },
       expires_at: q.quoteRequest.deadline,
     });
 

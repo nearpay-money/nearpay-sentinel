@@ -109,7 +109,13 @@ describe("signing", () => {
         fingerprint: destinationFingerprint("near:mainnet", RECIPIENT, USDC_NEAR),
       },
       // CR-15-07: the origin asset, display data from sentinel's own read of 1Click's token registry
-      asset: { asset_id: USDC_BASE, symbol: "USDC", decimals: 6 },
+      asset: {
+        asset_id: USDC_BASE,
+        symbol: "USDC",
+        decimals: 6,
+        // spec 0.2.1: the token contract from the same registry read, inside the signed object
+        token: { standard: "erc20", address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" },
+      },
       expires_at: q.quote.deadline,
     });
     expect(Date.parse(signed.attestation.issued_at) % 1000).toBe(0);

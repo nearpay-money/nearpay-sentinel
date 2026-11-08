@@ -1,14 +1,16 @@
 /**
  * The provider's token registry read with sentinel's own credentials (CR-15-07, lld/sentinel.md §5
  * "Attested asset"): live 1Click `GET /v0/tokens` (5 s), test mode the sandbox's `GET /v0/tokens`
- * (service token). Only `assetId`, `symbol` and `decimals` are used. The list is cached per process for
+ * (service token). Only `assetId`, `symbol`, `decimals` and — for the attested token contract (spec 0.2.1) —
+ * `blockchain` and `contractAddress` are used (an entry without them still serves symbol/decimals, token null). The list is cached per process for
  * 10 minutes; when a refresh fails, a list younger than 6 hours is still used (an asset id's decimals do
  * not change); an asset missing from the list triggers at most one refresh per 30 s. No list at all is
  * {@link TokensUnavailable}: the co-signer refuses (fail closed).
  */
 import { httpClient } from "@nearpay-internal/http";
 import { OneClickToken, sandboxTokens } from "@nearpay-internal/spec";
-import type { AssetDisplay } from "../../address-integrity/assets.js";
+import { z } from "zod";
+import { type AssetDisplay, registryTokenContract } from "../../address-integrity/assets.js";
 import { oneClickAuthHeaders } from "./oneclick-auth.js";
 
 export class TokensUnavailable extends Error {
@@ -24,7 +26,10 @@ export const TOKENS_FRESH_MS = 10 * 60_000;
 export const TOKENS_MAX_AGE_MS = 6 * 60 * 60_000;
 export const TOKENS_MISS_REFRESH_MS = 30_000;
 
-const Entry = OneClickToken.pick({ assetId: true, symbol: true, decimals: true });
+const Entry = OneClickToken.pick({ assetId: true, symbol: true, decimals: true }).extend({
+  blockchain: z.string().nullish(),
+  contractAddress: z.string().nullish(),
+});
 
 /** Builds the asset map from a token list body; entries that do not parse are left out (and so refused). */
 export function tokenMap(body: unknown): Map<string, AssetDisplay> {
@@ -32,7 +37,12 @@ export function tokenMap(body: unknown): Map<string, AssetDisplay> {
   const map = new Map<string, AssetDisplay>();
   for (const item of body) {
     const e = Entry.safeParse(item);
-    if (e.success) map.set(e.data.assetId, { symbol: e.data.symbol, decimals: e.data.decimals });
+    if (e.success)
+      map.set(e.data.assetId, {
+        symbol: e.data.symbol,
+        decimals: e.data.decimals,
+        token: registryTokenContract(e.data.blockchain, e.data.contractAddress),
+      });
   }
   return map;
 }
