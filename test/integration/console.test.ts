@@ -212,6 +212,9 @@ describe("two-person release", () => {
     });
     expect(self.status).toBe(403);
     expect((self.body as { error: { code: string } }).error.code).toBe("approver_conflict");
+    expect((self.body as { error: { message: string } }).error.message).toBe(
+      "This approval needs a different approver: the approver must be a different operator",
+    );
     const st = await s.call("GET", "/ops/kill_switch", { token: await tok(bob, "ops_admin", false) });
     expect(st.body).toMatchObject({ engaged: true });
   });

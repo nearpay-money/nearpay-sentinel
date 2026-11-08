@@ -102,8 +102,10 @@ async function pendingRow(t: Tx | Ctx["db"], lock: boolean): Promise<Row | undef
 
 function refuse(r: Refusal): never {
   if (r.error === "state_conflict") throw new ApiError("state_conflict", { message: `${r.reason}.` });
-  if (r.error === "approver_conflict") throw new ApiError("approver_conflict");
-  throw new ApiError(r.error);
+  // the catalogue message is "This approval needs a different approver: {reason}" — fill it
+  if (r.error === "approver_conflict") throw new ApiError("approver_conflict", { params: { reason: r.reason } });
+  // permission_denied's catalogue message has an {action} placeholder (step_up_required has none)
+  throw new ApiError(r.error, { params: { action: "perform this action" } });
 }
 
 /** `GET /ops/kill_switch`. */
