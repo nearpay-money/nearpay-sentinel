@@ -3,11 +3,12 @@
  * requirement fields (field-by-field equal, nothing added), the asset the payer sends with the registry's
  * symbol and decimals (never anything from the request), expires at the deadline, parses with the spec's
  * `Attestation`, and verifies once signed. And a full-precision `amountInFormatted` pins the decimals.
+ * Spec 0.2.1: the attested token contract never names a contract other than the one the asset id names.
  */
 import { Attestation } from "@nearpay/spec";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { formattedMatches } from "../../src/address-integrity/assets.js";
+import { assetShape, formattedMatches, reconcileToken } from "../../src/address-integrity/assets.js";
 import { buildAttestation } from "../../src/co-signer/attestation.js";
 import { loadSigningKey, signAttestation, verifyAttestation } from "../../src/co-signer/crypto.js";
 import { pemFromSeed } from "../support/keys.js";
@@ -38,7 +39,18 @@ const requirement = fc.record({
   binding: b58.map((x) => `np1:${x}`),
   deadline: time,
 });
-const display = fc.record({ symbol: fc.stringMatching(/^[A-Z]{1,10}$/), decimals: fc.integer({ min: 0, max: 255 }) });
+const token = fc.option(
+  fc.record({
+    standard: fc.constantFrom("erc20" as const, "native" as const, "nep141" as const, "spl" as const, "other" as const),
+    address: fc.option(fc.stringMatching(/^[a-z0-9.]{1,64}$/), { nil: null }),
+  }),
+  { nil: null },
+);
+const display = fc.record({
+  symbol: fc.stringMatching(/^[A-Z]{1,10}$/),
+  decimals: fc.integer({ min: 0, max: 255 }),
+  token,
+});
 const row = {
   merchant_name: "Acme GmbH",
   kyb_verified: true,
@@ -60,10 +72,25 @@ describe("attestation fields (property)", () => {
         expect(a.deposit).toEqual(d);
         expect(Object.keys(a.deposit ?? {}).sort()).toEqual(Object.keys(d).sort());
         expect(a.requirement).toBeUndefined();
-        expect(a.asset).toEqual({ asset_id: d.origin_asset_id, symbol: disp.symbol, decimals: disp.decimals });
+        expect(a.asset).toEqual({
+          asset_id: d.origin_asset_id,
+          symbol: disp.symbol,
+          decimals: disp.decimals,
+          token: disp.token,
+        });
         expect(a.expires_at).toBe(d.deadline);
         expect(Attestation.safeParse(a).success).toBe(true);
-        expect(verifyAttestation(signAttestation(a, key), key.publicRaw)).toBe(true);
+        const signed = signAttestation(a, key);
+        expect(verifyAttestation(signed, key.publicRaw)).toBe(true);
+        // the token contract is inside the signed object: changing it breaks the signature (spec 0.2.1)
+        const forged = {
+          ...signed,
+          attestation: {
+            ...signed.attestation,
+            asset: { ...a.asset, token: { standard: "erc20", address: "0xevil" } },
+          },
+        } as typeof signed;
+        expect(verifyAttestation(forged, key.publicRaw)).toBe(false);
       }),
       { numRuns: 300 },
     );
@@ -87,7 +114,7 @@ describe("attestation fields (property)", () => {
         expect(a.requirement).toEqual(r);
         expect(Object.keys(a.requirement ?? {}).sort()).toEqual(Object.keys(r).sort());
         expect(a.deposit).toBeUndefined();
-        expect(a.asset).toEqual({ asset_id: r.token, symbol: disp.symbol, decimals: disp.decimals });
+        expect(a.asset).toEqual({ asset_id: r.token, symbol: disp.symbol, decimals: disp.decimals, token: disp.token });
         expect(Attestation.safeParse(a).success).toBe(true);
       }),
       { numRuns: 300 },
@@ -109,6 +136,49 @@ describe("attestation fields (property)", () => {
           if (other !== d) expect(formattedMatches(n.toString(), formatted, other)).toBe(false);
         },
       ),
+      { numRuns: 1000 },
+    );
+  });
+
+  it("an attested token never contradicts the contract the asset id names (spec 0.2.1)", () => {
+    const hex40 = fc.stringMatching(/^[0-9a-f]{40}$/);
+    const id = fc.oneof(
+      hex40.map((h) => `nep141:base-0x${h}.omft.near`),
+      fc.stringMatching(/^[a-z][a-z0-9]{0,10}\.near$/).map((a) => `nep141:${a}`),
+      fc.constantFrom("nep141:base.omft.near", "nep141:sol.omft.near", "nep245:v2_1.omni.hot.tg:56_11"),
+    );
+    const listed = fc.option(
+      fc.record({
+        standard: fc.constantFrom(
+          "erc20" as const,
+          "native" as const,
+          "nep141" as const,
+          "spl" as const,
+          "other" as const,
+        ),
+        address: fc.option(
+          fc.oneof(
+            hex40.map((h) => `0x${h}`),
+            fc.stringMatching(/^[a-z]{1,8}\.near$/),
+          ),
+          {
+            nil: null,
+          },
+        ),
+      }),
+      { nil: null },
+    );
+    fc.assert(
+      fc.property(id, listed, (assetId, t) => {
+        const r = reconcileToken(assetId, t);
+        if (!r.ok || r.token === null) return;
+        const shape = assetShape(assetId);
+        if (shape.kind === "erc20" || shape.kind === "nep141") {
+          expect(r.token.standard).toBe(shape.kind);
+          expect(r.token.address).toBe(shape.contract);
+        }
+        if (shape.kind === "native") expect(r.token.standard).toBe("native");
+      }),
       { numRuns: 1000 },
     );
   });

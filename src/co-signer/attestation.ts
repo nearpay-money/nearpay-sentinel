@@ -2,7 +2,8 @@
  * The attestation object sentinel signs (lld/sentinel.md §5, spec `Attestation`), pure. Every deposit /
  * requirement field is copied field by field from what the checks verified (the request, after R4 proved
  * it is the provider's), the merchant and destination come from identity's registry row, and the asset
- * display data from sentinel's own token-registry read (CR-15-07) — never from the request.
+ * display data and token contract from sentinel's own token-registry read (CR-15-07, spec 0.2.1) — never
+ * from the request, rails or the payer.
  */
 import type { Attestation } from "@nearpay/spec";
 import { destinationFingerprint } from "@nearpay-internal/chains";
@@ -38,7 +39,11 @@ export interface AttestationInput {
 export function buildAttestation(
   b: AttestationInput,
   row: Pick<RegistryRow, "merchant_name" | "kyb_verified" | "asset_id" | "chain" | "address_norm">,
-  asset: { readonly symbol: string; readonly decimals: number },
+  asset: {
+    readonly symbol: string;
+    readonly decimals: number;
+    readonly token?: { readonly standard: string; readonly address: string | null } | null;
+  },
   nowMs: number,
 ): Attestation {
   const d = b.kind === "route_quote" ? b.deposit : undefined;
@@ -82,7 +87,13 @@ export function buildAttestation(
       chain: row.chain,
       fingerprint: destinationFingerprint(row.chain, row.address_norm, row.asset_id),
     },
-    asset: { asset_id: (d?.origin_asset_id ?? r?.token) as string, symbol: asset.symbol, decimals: asset.decimals },
+    asset: {
+      asset_id: (d?.origin_asset_id ?? r?.token) as string,
+      symbol: asset.symbol,
+      decimals: asset.decimals,
+      // spec 0.2.1: inside the signed object, from the same registry read (never the request)
+      token: asset.token ? { standard: asset.token.standard, address: asset.token.address } : null,
+    },
     issued_at: new Date(Math.floor(nowMs / 1000) * 1000).toISOString(),
     expires_at: new Date(deadline).toISOString(),
   } as Attestation;

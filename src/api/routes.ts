@@ -11,6 +11,7 @@ import {
   acknowledgeOpsFinding,
   approveOpsKillSwitchRelease,
   engageOpsKillSwitch,
+  getKillSwitch,
   getOpsFinding,
   getOpsKillSwitch,
   listOpsFindings,
@@ -22,7 +23,7 @@ import {
 import type { Sentinel } from "../app/context.js";
 import { attest } from "../co-signer/attest.js";
 import { acknowledgeFinding, getFinding, listFindings } from "../independent-reconciliation/findings.js";
-import { setKillSwitchSinglePerson } from "../kill-switch/kill-switch.js";
+import { killSwitchState, killSwitchView, setKillSwitchSinglePerson } from "../kill-switch/kill-switch.js";
 import {
   approveRelease,
   engageByOperator,
@@ -78,9 +79,10 @@ export function sentinelRoutes(s: Sentinel, keys: KeyInfo): RouteBinding[] {
     })),
     implement(setKillSwitchRoute, async (ctx) => {
       const actor = ctx.principal ? `ops:${ctx.principal.sub}` : "ops";
-      const st = await setKillSwitchSinglePerson(s, ctx.body.engaged, ctx.body.reason, actor);
-      return { engaged: st.engaged, reason: st.reason, actor: st.actor, updated_at: st.updated_at.toISOString() };
+      return killSwitchView(await setKillSwitchSinglePerson(s, ctx.body.engaged, ctx.body.reason, actor));
     }),
+    // spec 0.2.1: services (payments, rails, agentpay) read the switch at boot; never cached, straight from the row
+    implement(getKillSwitch, async () => killSwitchView(await killSwitchState(s))),
 
     // console (stage 2)
     implement(getOpsKillSwitch, async (ctx) => {

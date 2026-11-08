@@ -35,7 +35,22 @@ interface Row {
 
 const unix = (d: Date) => Math.floor(d.getTime() / 1000);
 
-export function findingView(r: Row): FindingView {
+/** Display names of the given account uuids (spec 0.2.1, from `evt.identity.account.*`). */
+export async function accountNames(
+  s: Pick<Sentinel, "db">,
+  accountIds: readonly string[],
+): Promise<Map<string, string>> {
+  const ids = [...new Set(accountIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await s.db
+    .selectFrom("account_names")
+    .select(["account_id", "display_name"])
+    .where("account_id", "in", ids)
+    .execute();
+  return new Map(rows.map((r) => [r.account_id, r.display_name]));
+}
+
+export function findingView(r: Row, displayName: string | null = null): FindingView {
   return {
     id: fromUuid("fnd", r.id),
     object: "audit_finding",
@@ -51,6 +66,7 @@ export function findingView(r: Row): FindingView {
     acknowledged_at: r.acknowledged_at ? unix(r.acknowledged_at) : null,
     acknowledged_by: r.acknowledged_by,
     acknowledgement_note: r.acknowledgement_note,
+    account_display_name: displayName,
   } as FindingView;
 }
 
@@ -116,7 +132,16 @@ export async function listFindings(s: Pick<Sentinel, "db">, q: Query) {
     .execute();
   const page = rows.slice(0, limit);
   if (reverse) page.reverse();
-  return { object: "list" as const, data: page.map(findingView), has_more: rows.length > limit, url: "/ops/findings" };
+  const names = await accountNames(
+    s,
+    page.map((r) => r.account_id),
+  );
+  return {
+    object: "list" as const,
+    data: page.map((r) => findingView(r, names.get(r.account_id) ?? null)),
+    has_more: rows.length > limit,
+    url: "/ops/findings",
+  };
 }
 
 async function findingRow(s: Pick<Sentinel, "db">, ref: string): Promise<Row> {
@@ -131,7 +156,8 @@ async function findingRow(s: Pick<Sentinel, "db">, ref: string): Promise<Row> {
 
 /** `GET /ops/findings/{id}`. */
 export async function getFinding(s: Pick<Sentinel, "db">, ref: string): Promise<FindingView> {
-  return findingView(await findingRow(s, ref));
+  const row = await findingRow(s, ref);
+  return findingView(row, (await accountNames(s, [row.account_id])).get(row.account_id) ?? null);
 }
 
 /**
@@ -176,5 +202,5 @@ export async function acknowledgeFinding(
   if (out === "acknowledged") throw new ApiError("state_conflict", { message: "The finding is already acknowledged." });
   if (out === "pass") throw new ApiError("state_conflict", { message: "A passing finding needs no acknowledgement." });
   s.log.warn({ finding: ref, operator: op.id }, "audit finding acknowledged");
-  return findingView(out);
+  return findingView(out, (await accountNames(s, [out.account_id])).get(out.account_id) ?? null);
 }
