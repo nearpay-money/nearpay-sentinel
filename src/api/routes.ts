@@ -4,6 +4,7 @@
  * step-up here (fail closed: the two-person rule must hold even where the service package does not
  * enforce `opsRoles` / ops step-up yet).
  */
+
 import { type AnyRoute, createDepositInstructionsAttestation, listAttestationKeys } from "@nearpay/spec";
 import { isId } from "@nearpay-internal/ids";
 import { ApiError, implement, type RequestContext, type RouteBinding } from "@nearpay-internal/service";
@@ -33,15 +34,25 @@ import {
   requestRelease,
 } from "../kill-switch/release.js";
 import { type Operator, stepUpFresh } from "../kill-switch/two-person.js";
+import { type ClientIpRule, clientIpRule, resolveClientIp } from "./client-ip.js";
 
 /**
- * The payer's IP: the first `X-Forwarded-For` hop, which the gateway sets (Traefik replaces the
- * header of untrusted clients), else the socket peer. Only the spoof counter uses it.
+ * The payer's IP by identity's rule (L-ID-07): `CF-Connecting-IP` on the server stage, the rightmost untrusted
+ * `X-Forwarded-For` hop locally; forwarding headers only from a trusted proxy peer (`NP_TRUSTED_PROXIES`), else the
+ * socket peer. Only the spoof counter uses it. Never the leftmost X-Forwarded-For hop: the client writes it.
  */
-export function clientIp(req: Pick<RequestContext["request"], "headers" | "ip">): string {
-  const xff = req.headers["x-forwarded-for"];
-  const first = (Array.isArray(xff) ? xff[0] : xff)?.split(",")[0]?.trim();
-  return (first || req.ip || "unknown").slice(0, 64);
+export function clientIp(
+  req: { headers: RequestContext["request"]["headers"]; socket?: { remoteAddress?: string | undefined } | undefined },
+  rule: ClientIpRule,
+): string {
+  const one = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v);
+  return (
+    resolveClientIp(rule, {
+      peer: req.socket?.remoteAddress,
+      cfConnectingIp: one(req.headers["cf-connecting-ip"]),
+      xForwardedFor: one(req.headers["x-forwarded-for"]),
+    }) ?? "unknown"
+  ).slice(0, 64);
 }
 
 /**
@@ -69,7 +80,9 @@ export interface KeyInfo {
 export function sentinelRoutes(s: Sentinel, keys: KeyInfo): RouteBinding[] {
   const operator = (ctx: RequestContext) => opsOperator(ctx.route, ctx.principal, s.now());
   return [
-    implement(createDepositInstructionsAttestation, async (ctx) => attest(s, ctx.body, clientIp(ctx.request))),
+    implement(createDepositInstructionsAttestation, async (ctx) =>
+      attest(s, ctx.body, clientIp(ctx.request, s.clientIp ?? clientIpRule(s.env))),
+    ),
     implement(listAttestationKeys, async () => ({
       object: "list" as const,
       keys: [

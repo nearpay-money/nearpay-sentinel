@@ -4,6 +4,7 @@
  * - `worker`  (`sentinel-auditor`) consumers (settled → audit job; destination disabled → cache
  *             eviction), jobs, outbox relay (kill-switch and finding events)
  */
+
 import { hostname } from "node:os";
 import type { KeySource } from "@nearpay-internal/auth";
 import { serviceTokenClient } from "@nearpay-internal/auth";
@@ -31,6 +32,7 @@ import {
 } from "@nearpay-internal/db";
 import { createService, type Service } from "@nearpay-internal/service";
 import { STREAMS, type Subject } from "@nearpay-internal/spec";
+import { clientIpRule } from "../api/client-ip.js";
 import { type KeyInfo, sentinelRoutes } from "../api/routes.js";
 import { ed25519PublicKey, loadSigningKey } from "../co-signer/crypto.js";
 import {
@@ -130,6 +132,7 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
     );
   const sentinel: Sentinel = {
     env: config.env,
+    clientIp: clientIpRule(config.env, { header: config.clientIpHeader, trustedProxies: config.trustedProxies }),
     db: database.db,
     registry: registry.db,
     log: undefined as unknown as Sentinel["log"],
