@@ -232,7 +232,9 @@ export async function fakeEsplora(
   txs: Map<string, unknown>,
   tip: { height: number },
 ): Promise<FakeServer & { failNext: number }> {
-  const ctl = { failNext: 0 };
+  // the handler reads the control from the returned object itself (set by the tests); an accessor pair
+  // passed to Object.assign would be copied as a plain value and never reach the handler
+  let ctl: { failNext: number } = { failNext: 0 };
   const server = await fakeServer((req) => {
     if (ctl.failNext > 0) {
       ctl.failNext--;
@@ -243,12 +245,7 @@ export async function fakeEsplora(
     const tx = m ? txs.get(m[1] as string) : undefined;
     return tx ? { status: 200, body: tx } : { status: 404, body: "Transaction not found" };
   });
-  return Object.assign(server, {
-    get failNext() {
-      return ctl.failNext;
-    },
-    set failNext(n: number) {
-      ctl.failNext = n;
-    },
-  });
+  const fake = Object.assign(server, { failNext: 0 });
+  ctl = fake;
+  return fake;
 }
