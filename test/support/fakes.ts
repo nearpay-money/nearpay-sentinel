@@ -212,3 +212,40 @@ export const mtTransfer = (to: string, token: string, amount: string) =>
     event: "mt_transfer",
     data: [{ old_owner_id: "solver.near", new_owner_id: to, token_ids: [token], amounts: [amount] }],
   })}`;
+
+// ---------------------------------------------------------------------------------------------
+// Solana and Bitcoin (Stage 4, §16): recorded RPC / Esplora answers
+// ---------------------------------------------------------------------------------------------
+
+/** Solana JSON-RPC answering `getTransaction`: signature → `result` (absent → null: unknown or not finalized). */
+export async function fakeSolanaRpc(txs: Map<string, unknown>): Promise<FakeServer> {
+  return fakeServer((req) => {
+    const b = req.body as { method: string; params: [string, { commitment?: string }] };
+    if (b.method !== "getTransaction" || b.params?.[1]?.commitment !== "finalized")
+      return { status: 200, body: { jsonrpc: "2.0", id: 1, error: { code: -32601, message: "unsupported" } } };
+    return { status: 200, body: { jsonrpc: "2.0", id: 1, result: txs.get(b.params[0]) ?? null } };
+  });
+}
+
+/** Esplora answering `/tx/{txid}` (absent → 404) and `/blocks/tip/height` (`tip.height`). */
+export async function fakeEsplora(
+  txs: Map<string, unknown>,
+  tip: { height: number },
+): Promise<FakeServer & { failNext: number }> {
+  // the handler reads the control from the returned object itself (set by the tests); an accessor pair
+  // passed to Object.assign would be copied as a plain value and never reach the handler
+  let ctl: { failNext: number } = { failNext: 0 };
+  const server = await fakeServer((req) => {
+    if (ctl.failNext > 0) {
+      ctl.failNext--;
+      return { status: 503, body: "unavailable" };
+    }
+    if (req.path === "/blocks/tip/height") return { status: 200, body: tip.height };
+    const m = /^\/tx\/([0-9a-f]{64})$/.exec(req.path);
+    const tx = m ? txs.get(m[1] as string) : undefined;
+    return tx ? { status: 200, body: tx } : { status: 404, body: "Transaction not found" };
+  });
+  const fake = Object.assign(server, { failNext: 0 });
+  ctl = fake;
+  return fake;
+}

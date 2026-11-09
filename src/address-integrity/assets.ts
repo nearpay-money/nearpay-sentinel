@@ -3,6 +3,8 @@
  * from the id alone — never from a registry another service controls.
  */
 import { chainByBlockchain } from "@nearpay-internal/chains";
+import { keccak_256 } from "@noble/hashes/sha3.js";
+import bs58 from "bs58";
 
 /** NEAR mainnet, where the Intents contract and NEP-141 tokens live. */
 export const NEAR = "near:mainnet";
@@ -10,12 +12,14 @@ export const NEAR = "near:mainnet";
 /**
  * What a NEAR Intents asset id says about its token, independently of any registry (PoA bridge,
  * `omft.near`): `nep141:<prefix>-0x<20 bytes>.omft.near` → an ERC-20 on that EVM chain;
- * `nep141:<prefix>.omft.near` → the chain's native asset; `nep141:<prefix>-<token>.omft.near` → another
- * bridged token of that chain; `nep141:<account>` → a NEP-141 token on NEAR; anything else (other
+ * `nep141:<prefix>.omft.near` → the chain's native asset; `nep141:sol-<40 hex>.omft.near` → a Solana SPL
+ * token whose mint hashes to that value (Stage 4, {@link splAssetHash}); `nep141:<prefix>-<token>.omft.near`
+ * → another bridged token of that chain; `nep141:<account>` → a NEP-141 token on NEAR; anything else (other
  * bridges, NEP-245 ids) → `other`. `chain` is null when the bridge prefix is not a known chain.
  */
 export type AssetShape =
   | { readonly kind: "erc20"; readonly chain: string; readonly contract: string }
+  | { readonly kind: "spl"; readonly chain: string; readonly hash20: string }
   | { readonly kind: "native"; readonly chain: string | null }
   | { readonly kind: "bridged"; readonly chain: string | null }
   | { readonly kind: "nep141"; readonly contract: string }
@@ -30,11 +34,29 @@ export function assetShape(assetId: string): AssetShape {
     if (token === undefined) return { kind: "native", chain };
     if (info?.family === "evm" && /^0x[0-9a-f]{40}$/.test(token))
       return { kind: "erc20", chain: info.caip2, contract: token };
+    if (info?.family === "solana" && /^[0-9a-f]{40}$/.test(token))
+      return { kind: "spl", chain: info.caip2, hash20: token };
     return { kind: "bridged", chain };
   }
   const nep141 = /^nep141:([a-z0-9][a-z0-9._-]*)$/.exec(assetId);
   if (nep141) return { kind: "nep141", contract: nep141[1] as string };
   return { kind: "other" };
+}
+
+/**
+ * The omft token part of a Solana SPL mint (lld/sentinel.md §16, spec `chains-solana-bitcoin.json` `omft`):
+ * `hex(keccak256(raw 32 mint bytes)[12..32])`; null when `mint` is not base58 of 32 bytes.
+ */
+export function splAssetHash(mint: string): string | null {
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) return null;
+  let raw: Uint8Array;
+  try {
+    raw = bs58.decode(mint);
+  } catch {
+    return null;
+  }
+  if (raw.length !== 32) return null;
+  return Buffer.from(keccak_256(raw).subarray(12)).toString("hex");
 }
 
 /** The chain an asset id lives on, when its id says so (null: not derivable). */
@@ -62,6 +84,8 @@ export interface AssetDisplay {
    * entry: its `blockchain` family and `contractAddress`. Null / absent when the entry does not say.
    */
   readonly token?: TokenContractView | null;
+  /** USD price from the same registry entry (decimal string), for the Bitcoin audit tier only (§16). */
+  readonly priceUsd?: string | null;
 }
 
 /** Spec `TokenContract` (wallet path). */
@@ -113,7 +137,10 @@ export function registryTokenContract(
  * An id naming an ERC-20 (`<chain>-0x….omft.near`) or a NEP-141 account (`nep141:<account>`) needs that
  * contract: a different contract (or another standard) is a contradiction (refused); an entry that lists no
  * contract for it (`native`) gives no token (null: the manual path — never "send the native coin"). An id
- * naming the chain's native coin needs `native`. Ids that name no contract accept what the registry says.
+ * naming a Solana SPL token (`sol-<hash20>.omft.near`, Stage 4) is reconciled the same way: the registry's
+ * `spl` mint must hash to `hash20` ({@link splAssetHash}), anything else refuses, and a listing without a
+ * mint gives no token. An id naming the chain's native coin needs `native`. Ids that name no contract
+ * accept what the registry says.
  */
 export function reconcileToken(
   assetId: string,
@@ -125,6 +152,12 @@ export function reconcileToken(
     if (token.standard === "native") return { ok: true, token: null };
     const standard = shape.kind;
     return token.standard === standard && token.address === shape.contract ? { ok: true, token } : { ok: false };
+  }
+  if (shape.kind === "spl") {
+    if (token.standard === "native") return { ok: true, token: null };
+    return token.standard === "spl" && token.address !== null && splAssetHash(token.address) === shape.hash20
+      ? { ok: true, token }
+      : { ok: false };
   }
   if (shape.kind === "native") return token.standard === "native" ? { ok: true, token } : { ok: false };
   return { ok: true, token };

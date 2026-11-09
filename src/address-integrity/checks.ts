@@ -10,9 +10,10 @@
  * for the route class before it stores the quote. A fee-free quote (fee schedule at 0 bps) carries no
  * `appFees` and diverts nothing, so it passes.
  */
-import { normalizeAddress } from "@nearpay-internal/chains";
+import { normalizeAddress, validateAddress } from "@nearpay-internal/chains";
 import type { OneClickStatusQuoteResponse } from "@nearpay-internal/spec";
 import { assetChain, NEAR } from "./assets.js";
+import { attestedChain } from "./attested-chains.js";
 
 export type FailureClass = "security" | "ambiguous" | "stale" | "unavailable";
 
@@ -138,6 +139,11 @@ export function checkRouteQuote(i: RouteQuoteInput): { ok: true; row: RegistryRo
   // NEAR; otherwise the origin asset's own chain, whenever its id says so
   const depositChain = q.quoteRequest.depositType === "INTENTS" ? NEAR : assetChain(q.quoteRequest.originAsset);
   if (depositChain !== null && i.deposit.chain !== depositChain) security.push("R4 deposit chain differs");
+  // Solana / Bitcoin (§16): the provider's deposit address must also be a valid address of that chain
+  if (depositChain !== null && attestedChain(depositChain)?.depositAddressShape) {
+    const v = validateAddress(depositChain, q.quote.depositAddress ?? "");
+    if (!v.ok) security.push(`R4 deposit address is not a valid ${depositChain} address (${v.reason})`);
+  }
   // The payer-facing deadline is when 1Click starts refunding: quoteRequest.deadline. It is NOT covered by the
   // quote signature (the SDK hashes {...request, ...quote}, so quote.deadline overwrites it); it is trusted
   // because sentinel reads it from 1Click itself over TLS (R1), never from rails or checkout. Live 1Click's

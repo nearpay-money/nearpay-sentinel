@@ -6,20 +6,24 @@
  *   view), active when the execution was created; for a refund leg (`kind: refund`) the same of its
  *   source (`origin.refund_to`), since the recipient is the payer;
  * - `settlement` — rails' settlement is self-consistent and sentinel's own read shows it: the
- *   destination chain with sentinel's RPC credentials (Tier A: EVM, NEAR), the sandbox's simulated
+ *   destination chain with sentinel's RPC credentials (Tier A: EVM, NEAR; Stage 4: Solana finalized
+ *   token-balance delta, Bitcoin outputs + confirmations per tier — §16), the sandbox's simulated
  *   chain (test mode), or the provider's signed status with sentinel's key (Tier B, and live chains
- *   sentinel cannot read).
+ *   outside the attested set). An attested Stage 4 chain without a sentinel reader is never sent to
+ *   Tier B: it records `unverifiable` and alerts `audit_coverage_missing{chain}` (fail closed).
  *
  * Not final / not found / unreachable is transient: the job retries with backoff (about 85 minutes
  * over {@link AUDIT_MAX_ATTEMPTS} attempts) and the last attempt records `unverifiable`. Every
  * non-pass finding emits `evt.sentinel.audit_finding.created` (compliance opens a case; mismatch pages).
  */
 
+import { BITCOIN_CONFIRMATION_TIERS, BITCOIN_MAINNET, requiredConfirmations } from "@nearpay/spec";
 import { normalizeAddress } from "@nearpay-internal/chains";
 import { emit, sql } from "@nearpay-internal/db";
 import { fromUuid, toUuid, uuidv7 } from "@nearpay-internal/ids";
 import type { Execution } from "@nearpay-internal/spec";
 import { assetShape, NEAR } from "../address-integrity/assets.js";
+import { attestedChain } from "../address-integrity/attested-chains.js";
 import type { Sentinel } from "../app/context.js";
 import { ChainUnavailable } from "../infra/clients/chains.js";
 import {
@@ -35,6 +39,7 @@ import {
   settlementChain,
   type Via,
 } from "./audit.js";
+import { bitcoinReceived, type SolanaAsset, solanaReceived } from "./chain-reads.js";
 
 export const AUDIT_JOB = "audit.execution";
 export const AUDIT_MAX_ATTEMPTS = 10;
@@ -61,9 +66,9 @@ interface Verdict {
   readonly read?: ChainRead;
 }
 
-/** Transaction hash as stored and compared: hex (EVM) case-folded, base58 (NEAR) exact. */
+/** Transaction hash as stored and compared: hex (EVM, Bitcoin) case-folded, base58 (NEAR, Solana) exact. */
 export function txKey(chain: string, hash: string): string {
-  return chain.startsWith("eip155:") ? hash.toLowerCase() : hash;
+  return chain.startsWith("eip155:") || chain.startsWith("bip122:") ? hash.toLowerCase() : hash;
 }
 
 const verdict = (result: AuditResult, reason: string, details: Record<string, unknown> = {}): Verdict => ({
@@ -130,6 +135,9 @@ async function settlementCheck(s: Sentinel, x: Execution): Promise<Verdict> {
   const base = { tx_hash: e.tx_hash, chain, tier: e.tier, source: e.source };
   if (!x.livemode) return sandboxRead(s, x, recipient, base);
   if (e.tier === "B") return providerCheck(s, x, recipient, { ...base, why: "rails accepted Tier B evidence" });
+  const own = attestedChain(chain)?.read;
+  if (own === "solana_finalized") return solanaRead(s, x, recipient, base);
+  if (own === "bitcoin_confirmations") return bitcoinRead(s, x, recipient, base);
   if (chain === NEAR) return nearRead(s, x, recipient, base);
   if (chain.startsWith("eip155:")) {
     const reader = s.evm.get(chain);
@@ -174,8 +182,18 @@ async function sandboxRead(
     throw new AuditRetry(`sandbox unreachable: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!tx) throw new AuditRetry("simulated transaction not found");
-  if (!tx.finalized) throw new AuditRetry("simulated transaction not final");
-  const lower = x.settlement.recipient_type === "intents" || !x.settlement.chain.startsWith("eip155:");
+  const sim = tx;
+  // Stage 4 (§16, sandbox §10): a landed-but-failed Solana tx moved nothing; Bitcoin needs its tier
+  if (sim.failed === true) return verdict("mismatch", "simulated settlement transaction failed", base);
+  if (settlementChain(x) === BITCOIN_MAINNET) {
+    const required = await bitcoinTier(s, x);
+    const confirmations = typeof sim.confirmations === "number" ? sim.confirmations : 0;
+    if (confirmations < required)
+      throw new AuditRetry(`simulated Bitcoin transaction has ${confirmations}/${required} confirmations`);
+  } else if (!tx.finalized) throw new AuditRetry("simulated transaction not final");
+  // Intents accounts and NEAR accounts compare lower-case; other chains in their normal form (EVM
+  // lower-case, bech32 lower-case, Solana base58 exactly as written)
+  const lower = x.settlement.recipient_type === "intents" || x.settlement.chain === NEAR;
   const transfers: Observed[] = tx.transfers.map((t) => ({
     via: "sim",
     to: lower ? t.to.toLowerCase() : safeNormal(x.settlement.chain, t.to),
@@ -236,6 +254,106 @@ async function evmRead(s: Sentinel, x: Execution, recipient: string, base: Recor
     ...base,
     token: shape.kind === "erc20" ? shape.contract : "native",
   });
+}
+
+/** An attested Stage 4 chain without a sentinel reader: unverifiable, never Tier B (§16, fail closed). */
+function coverageMissing(s: Sentinel, x: Execution, chain: string, base: Record<string, unknown>): Verdict {
+  s.metrics.coverageMissing(chain);
+  s.log.error({ execution: x.id, chain }, "ALERT audit_coverage_missing: no sentinel reader for this chain");
+  return verdict("unverifiable", `no sentinel reader configured for ${chain} (audit_coverage_missing)`, base);
+}
+
+async function solanaRead(
+  s: Sentinel,
+  x: Execution,
+  recipient: string,
+  base: Record<string, unknown>,
+): Promise<Verdict> {
+  const e = x.evidence as NonNullable<Execution["evidence"]>;
+  if (!s.solana) return coverageMissing(s, x, e.chain, base);
+  const shape = assetShape(x.settlement.asset_id);
+  let asset: SolanaAsset;
+  if (shape.kind === "native" && shape.chain === e.chain) asset = { kind: "native" };
+  else if (shape.kind === "spl" && shape.chain === e.chain) asset = { kind: "spl", hash20: shape.hash20 };
+  else return verdict("unverifiable", "the asset's Solana token is not derivable from its id", base);
+  let result: unknown;
+  try {
+    result = await s.solana.transaction(e.tx_hash);
+  } catch (err) {
+    if (err instanceof ChainUnavailable) throw new AuditRetry(`Solana RPC: ${err.message}`);
+    throw err;
+  }
+  if (result === null) throw new AuditRetry("Solana transaction not found or not finalized");
+  const read = solanaReceived(result, recipient, asset);
+  if (!read) throw new AuditRetry("Solana RPC answer is malformed");
+  if (read.failed) return verdict("mismatch", "settlement transaction failed (meta.err)", base);
+  return {
+    result: "pass",
+    details: {
+      ...base,
+      token: asset.kind === "spl" ? (read.mint ?? `hash20:${asset.hash20}`) : "native",
+      observed: read.amount.toString(),
+      chain_read: { slot: read.slot, amount: read.amount.toString() },
+    },
+    read: { chain: e.chain, hash: e.tx_hash, recipient, assetId: x.settlement.asset_id, observed: read.amount },
+  };
+}
+
+/**
+ * Confirmations a Bitcoin settlement needs (§16): the tier for its USD value, priced with the decimals and
+ * USD price of sentinel's own token registry for the mode; no registry, no price or an unparseable value →
+ * the strictest (last) tier.
+ */
+async function bitcoinTier(s: Sentinel, x: Execution): Promise<number> {
+  const strictest = (BITCOIN_CONFIRMATION_TIERS[BITCOIN_CONFIRMATION_TIERS.length - 1] as { confirmations: number })
+    .confirmations;
+  const registry = x.livemode ? s.liveTokens : s.testTokens;
+  const display = registry ? await registry.asset(x.settlement.asset_id).catch(() => null) : null;
+  if (!display?.priceUsd || x.settled_amount === null || !/^\d+$/.test(x.settled_amount)) return strictest;
+  const micros = usdMicros(BigInt(x.settled_amount), display.decimals, display.priceUsd);
+  return micros === null ? strictest : requiredConfirmations(BITCOIN_CONFIRMATION_TIERS, micros);
+}
+
+async function bitcoinRead(
+  s: Sentinel,
+  x: Execution,
+  recipient: string,
+  base: Record<string, unknown>,
+): Promise<Verdict> {
+  const e = x.evidence as NonNullable<Execution["evidence"]>;
+  if (!s.bitcoin) return coverageMissing(s, x, e.chain, base);
+  const shape = assetShape(x.settlement.asset_id);
+  if (!(shape.kind === "native" && shape.chain === e.chain))
+    return verdict("unverifiable", "the asset is not the chain's native coin", base);
+  const txid = e.tx_hash.toLowerCase();
+  let got: Awaited<ReturnType<NonNullable<Sentinel["bitcoin"]>["tx"]>>;
+  try {
+    got = await s.bitcoin.tx(txid);
+  } catch (err) {
+    if (err instanceof ChainUnavailable) throw new AuditRetry(`Esplora: ${err.message}`);
+    throw err;
+  }
+  if (!got) throw new AuditRetry("Bitcoin transaction not found");
+  const read = bitcoinReceived(got.tx, got.tipHeight, recipient, txid);
+  if (!read) throw new AuditRetry("Esplora answer is malformed");
+  const required = await bitcoinTier(s, x);
+  if (read.confirmations < required)
+    throw new AuditRetry(`Bitcoin transaction has ${read.confirmations}/${required} confirmations`);
+  return {
+    result: "pass",
+    details: {
+      ...base,
+      token: "native",
+      observed: read.amount.toString(),
+      chain_read: {
+        block_height: read.blockHeight,
+        amount: read.amount.toString(),
+        confirmations: read.confirmations,
+        required_confirmations: required,
+      },
+    },
+    read: { chain: e.chain, hash: txid, recipient, assetId: x.settlement.asset_id, observed: read.amount },
+  };
 }
 
 /** Tier B: the provider's signed status, read with sentinel's own credentials. */

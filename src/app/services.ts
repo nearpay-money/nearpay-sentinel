@@ -33,9 +33,26 @@ import { createService, type Service } from "@nearpay-internal/service";
 import { STREAMS, type Subject } from "@nearpay-internal/spec";
 import { type KeyInfo, sentinelRoutes } from "../api/routes.js";
 import { ed25519PublicKey, loadSigningKey } from "../co-signer/crypto.js";
-import { type ApiConfig, evmRpcUrls, nearRpcUrls, type SharedConfig, type WorkerConfig } from "../config.js";
+import {
+  type ApiConfig,
+  bitcoinEsploraUrls,
+  evmRpcUrls,
+  nearRpcUrls,
+  type SharedConfig,
+  solanaRpcUrls,
+  type WorkerConfig,
+} from "../config.js";
 import { deadLetters, sentinelHandlers } from "../consumers/handlers.js";
-import { type EvmReader, evmReader, type NearReader, nearReader } from "../infra/clients/chains.js";
+import {
+  type EsploraReader,
+  type EvmReader,
+  esploraReader,
+  evmReader,
+  type NearReader,
+  nearReader,
+  type SolanaReader,
+  solanaReader,
+} from "../infra/clients/chains.js";
 import { oneClickStatus, type SandboxStatus, type StatusProvider, sandboxStatus } from "../infra/clients/providers.js";
 import { railsClient } from "../infra/clients/rails.js";
 import { oneClickTokens, sandboxTokenRegistry, type TokenRegistry } from "../infra/clients/tokens.js";
@@ -68,6 +85,8 @@ export interface ServiceDeps {
   cache?: AttestationCache;
   near?: NearReader | null;
   evm?: ReadonlyMap<string, EvmReader>;
+  solana?: SolanaReader | null;
+  bitcoin?: EsploraReader | null;
   fetch?: typeof fetch;
   random?: () => number;
   now?: () => number;
@@ -158,6 +177,18 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
         ? deps.near
         : nearReader({ urls: nearRpcUrls(config), senderHint: config.intentsContract, ...f }),
     evm,
+    solana:
+      deps.solana !== undefined
+        ? deps.solana
+        : solanaRpcUrls(config).length
+          ? solanaReader({ urls: solanaRpcUrls(config), ...f })
+          : null,
+    bitcoin:
+      deps.bitcoin !== undefined
+        ? deps.bitcoin
+        : bitcoinEsploraUrls(config).length
+          ? esploraReader({ urls: bitcoinEsploraUrls(config), ...f })
+          : null,
     auditSampleRate: config.auditSampleRate,
     auditAlwaysUsdMicros: BigInt(Math.round(config.auditAlwaysUsd * 1_000_000)),
     random: deps.random ?? Math.random,

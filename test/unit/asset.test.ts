@@ -90,13 +90,21 @@ describe("token registry", () => {
       },
       () => now,
     );
-    expect(await r.asset(USDC)).toEqual({ symbol: "USDC", decimals: 6, token: { standard: "native", address: null } });
+    expect(await r.asset(USDC)).toMatchObject({
+      symbol: "USDC",
+      decimals: 6,
+      token: { standard: "native", address: null },
+    });
     now = TOKENS_FRESH_MS - 1;
     await r.asset(USDC);
     expect(calls).toBe(1);
     fail = true;
     now = TOKENS_FRESH_MS;
-    expect(await r.asset(USDC)).toEqual({ symbol: "USDC", decimals: 6, token: { standard: "native", address: null } });
+    expect(await r.asset(USDC)).toMatchObject({
+      symbol: "USDC",
+      decimals: 6,
+      token: { standard: "native", address: null },
+    });
     expect(calls).toBe(2);
     now = TOKENS_MAX_AGE_MS;
     await expect(r.asset(USDC)).rejects.toThrow(TokensUnavailable);
@@ -210,6 +218,6 @@ describe("attested token contract (spec 0.2.1)", () => {
       { assetId: "nep141:wrap.near", decimals: 24, symbol: "wNEAR", price: 4, priceUpdatedAt: "x" },
     ]);
     expect(m.get(USDC)?.token).toEqual({ standard: "erc20", address: USDC_CONTRACT });
-    expect(m.get("nep141:wrap.near")).toEqual({ symbol: "wNEAR", decimals: 24, token: null });
+    expect(m.get("nep141:wrap.near")).toEqual({ symbol: "wNEAR", decimals: 24, token: null, priceUsd: "4" });
   });
 });
