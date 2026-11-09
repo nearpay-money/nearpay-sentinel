@@ -1,7 +1,9 @@
 /** Configuration (lld/sentinel.md §10, foundations §13). */
+
 import { NearAccountId } from "@nearpay/spec";
 import { baseConfigShape, list, loadConfig, secret, url } from "@nearpay-internal/service";
 import { z } from "zod";
+import { CLIENT_IP_HEADERS } from "./api/client-ip.js";
 
 const json = <T extends z.ZodType>(schema: T, fallback: string) =>
   z
@@ -32,6 +34,10 @@ const rawEd25519 = z
 const timestamp = z.string().refine((s) => Number.isFinite(Date.parse(s)), "an ISO 8601 timestamp");
 
 const shared = {
+  /** Client IP source behind the gateway (default: cf-connecting-ip on the server stage, x-forwarded-for locally). */
+  clientIpHeader: z.enum(CLIENT_IP_HEADERS).optional(),
+  /** CIDRs of the proxies in front of sentinel whose forwarding headers count (default: loopback + private ranges). */
+  trustedProxies: list(z.string().min(1)).optional(),
   ...baseConfigShape,
   dbUrl: secret(url(["postgres:", "postgresql:"])),
   /** identity's database as `sentinel_ro` (SELECT on `sentinel_destination_registry` only). */

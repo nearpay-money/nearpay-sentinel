@@ -5,6 +5,7 @@ import type { Kysely, Transaction } from "@nearpay-internal/db";
 import type { Logger, ServiceMetrics } from "@nearpay-internal/service";
 import { Redis } from "ioredis";
 import type { ProviderSplit } from "../address-integrity/checks.js";
+import type { ClientIpRule } from "../api/client-ip.js";
 import type { SigningKey } from "../co-signer/crypto.js";
 import type { EsploraReader, EvmReader, NearReader, SolanaReader } from "../infra/clients/chains.js";
 import type { SandboxStatus, StatusProvider } from "../infra/clients/providers.js";
@@ -122,6 +123,8 @@ export interface RailsClient {
 
 export interface Sentinel {
   readonly env: string;
+  /** Where the client IP comes from (NP_CLIENT_IP_HEADER, NP_TRUSTED_PROXIES); default: by NP_ENV. */
+  readonly clientIp?: ClientIpRule;
   readonly db: Kysely<DB>;
   readonly registry: Kysely<RegistryDB>;
   log: Logger;

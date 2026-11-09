@@ -121,7 +121,15 @@ describe("signing", () => {
     expect(Date.parse(signed.attestation.issued_at) % 1000).toBe(0);
     const [rec] = await rows(b.attempt_id);
     expect(rec).toMatchObject({ result: "signed", destination_id: dest, client_ip: "203.0.113.7", reasons: [] });
+    // a forged leftmost X-Forwarded-For hop does not change the recorded IP (the gateway appends the real peer)
     expect(rec?.account_id).toBe(toUuid(s.account, "acct"));
+    const fb = body(oc.quote({ request: { appFees: fees() } }));
+    const forged = await s.call("POST", PATH, {
+      body: fb,
+      headers: { "x-forwarded-for": "6.6.6.6, 203.0.113.8, 10.0.0.1" },
+    });
+    expect(forged.status).toBe(200);
+    expect((await rows(fb.attempt_id))[0]).toMatchObject({ client_ip: "203.0.113.8" });
   });
 
   it("re-serves the cached attestation without asking the provider again (idempotent retries)", async () => {
