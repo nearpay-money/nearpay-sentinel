@@ -10,8 +10,14 @@
  */
 import { verifyQuoteSignature } from "@defuse-protocol/one-click-sdk-typescript";
 import { HttpError, httpClient } from "@nearpay-internal/http";
-import { type OneClickStatusQuoteResponse, OneClickStatusResponse, sandboxGetTx } from "@nearpay-internal/spec";
+import {
+  type OneClickStatusQuoteResponse,
+  OneClickStatusResponse,
+  type SimTx,
+  sandboxGetTx,
+} from "@nearpay-internal/spec";
 import bs58 from "bs58";
+import type { z } from "zod";
 import { oneClickAuthHeaders } from "./oneclick-auth.js";
 
 export type StatusLookup =
@@ -113,10 +119,8 @@ export function oneClickStatus(o: {
 }
 
 export interface SandboxStatus extends StatusProvider {
-  tx(
-    chain: string,
-    hash: string,
-  ): Promise<{ finalized: boolean; transfers: { token: string; to: string; amount: string }[] } | null>;
+  /** Spec `SimTx` (0.4.0: `confirmations`, `failed`, `block_ref` for Solana/Bitcoin, sandbox §10). */
+  tx(chain: string, hash: string): Promise<z.infer<typeof SimTx> | null>;
 }
 
 export function sandboxStatus(o: {

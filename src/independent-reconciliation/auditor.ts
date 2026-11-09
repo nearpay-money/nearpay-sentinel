@@ -17,6 +17,7 @@
  * non-pass finding emits `evt.sentinel.audit_finding.created` (compliance opens a case; mismatch pages).
  */
 
+import { BITCOIN_CONFIRMATION_TIERS, BITCOIN_MAINNET, requiredConfirmations } from "@nearpay/spec";
 import { normalizeAddress } from "@nearpay-internal/chains";
 import { emit, sql } from "@nearpay-internal/db";
 import { fromUuid, toUuid, uuidv7 } from "@nearpay-internal/ids";
@@ -25,12 +26,6 @@ import { assetShape, NEAR } from "../address-integrity/assets.js";
 import { attestedChain } from "../address-integrity/attested-chains.js";
 import type { Sentinel } from "../app/context.js";
 import { ChainUnavailable } from "../infra/clients/chains.js";
-import {
-  BITCOIN_CONFIRMATION_TIERS,
-  BITCOIN_MAINNET,
-  requiredConfirmations,
-  type SimTxStage4,
-} from "../spec-0.4.0-placeholder.js";
 import {
   type AuditResult,
   attribute,
@@ -187,7 +182,7 @@ async function sandboxRead(
     throw new AuditRetry(`sandbox unreachable: ${err instanceof Error ? err.message : String(err)}`);
   }
   if (!tx) throw new AuditRetry("simulated transaction not found");
-  const sim = tx as typeof tx & SimTxStage4;
+  const sim = tx;
   // Stage 4 (§16, sandbox §10): a landed-but-failed Solana tx moved nothing; Bitcoin needs its tier
   if (sim.failed === true) return verdict("mismatch", "simulated settlement transaction failed", base);
   if (settlementChain(x) === BITCOIN_MAINNET) {

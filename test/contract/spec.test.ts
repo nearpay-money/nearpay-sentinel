@@ -5,14 +5,22 @@
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { PUBLIC_ROUTES } from "@nearpay/spec";
+import { Evidence, PUBLIC_ROUTES, SPEC_VERSION } from "@nearpay/spec";
 import { unhandledSubjects } from "@nearpay-internal/bus";
 import { unimplementedRoutes } from "@nearpay-internal/service";
-import { INTERNAL_ROUTES, OneClickQuoteResponse, SUBJECTS, type Subject } from "@nearpay-internal/spec";
+import {
+  INTERNAL_ROUTES,
+  OneClickQuoteResponse,
+  SimTx,
+  SPEC_INTERNAL_VERSION,
+  SUBJECTS,
+  type Subject,
+} from "@nearpay-internal/spec";
 import { describe, expect, it } from "vitest";
 import { sentinelRoutes } from "../../src/api/routes.js";
 import { sentinelHandlers } from "../../src/consumers/handlers.js";
 import { fixture } from "../support/keys.js";
+import { specVector } from "../support/vectors.js";
 
 const ALL = [...PUBLIC_ROUTES, ...INTERNAL_ROUTES];
 
@@ -61,5 +69,39 @@ describe("routes and events", () => {
 describe("provider wire schemas", () => {
   it("parse the recorded 1Click quote", () => {
     expect(OneClickQuoteResponse.safeParse(fixture("oneclick/dry-quote.json")).success).toBe(true);
+  });
+});
+
+describe("spec 0.4.0 (Stage 4 chains, lld/sentinel.md §16)", () => {
+  it("is built against spec 0.4.0; Stage 4 adds no sentinel route", () => {
+    expect(SPEC_VERSION).toBe("0.4.0");
+    expect(SPEC_INTERNAL_VERSION).toBe("0.4.0");
+    expect(ALL.filter((r) => r.service === "sentinel" && r.stage > 2).map((r) => r.id)).toEqual([]);
+  });
+
+  it("the Solana evidence of the vectors parses as spec Evidence (what evt.rails.execution.settled carries)", () => {
+    const V = specVector<{ evidence: { solana: { cases: { evidence: Record<string, unknown> | null }[] } } }>(
+      "chains-solana-bitcoin.json",
+    );
+    const evidences = V.evidence.solana.cases.flatMap((c) => (c.evidence ? [c.evidence] : []));
+    expect(evidences.length).toBeGreaterThan(0);
+    for (const e of evidences) {
+      const parsed = Evidence.safeParse(e);
+      expect(parsed.data?.solana?.signature).toBe(e.tx_hash);
+      expect(parsed.success, JSON.stringify(parsed.error?.issues ?? [])).toBe(true);
+    }
+  });
+
+  it("SimTx carries the Stage 4 fields the test-mode audit reads (failed, confirmations)", () => {
+    const tx = SimTx.parse({
+      finalized: false,
+      confirmations: 1,
+      failed: false,
+      block_ref: "900000",
+      transfers: [
+        { token: "nep141:btc.omft.near", to: "bc1qgjvrfv789jcls63y95cgan53lq88jnuh32w0fq", amount: "1", vout: 0 },
+      ],
+    });
+    expect(tx).toMatchObject({ confirmations: 1, failed: false });
   });
 });

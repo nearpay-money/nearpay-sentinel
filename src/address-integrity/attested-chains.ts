@@ -4,7 +4,7 @@
  * own reads and credentials. Any other chain: co-sign when the omft prefix names the origin chain; audit
  * through the provider's signed status (Tier B).
  */
-import { BITCOIN_MAINNET, SOLANA_MAINNET } from "../spec-0.4.0-placeholder.js";
+import { BITCOIN_MAINNET, SOLANA_MAINNET } from "@nearpay/spec";
 
 /** How the `settlement` finding reads a chain (§8.1, §16). */
 export type OwnRead = "near_final" | "evm_finalized" | "solana_finalized" | "bitcoin_confirmations";

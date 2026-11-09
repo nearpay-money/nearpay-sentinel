@@ -3,13 +3,14 @@
  * hashes to; sentinel's Solana and Bitcoin reads count exactly what reached the recipient in the asset and
  * nothing else; the confirmation tier never weakens as the value grows.
  */
+
+import { BITCOIN_CONFIRMATION_TIERS, requiredConfirmations } from "@nearpay/spec";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import bs58 from "bs58";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { reconcileToken, splAssetHash } from "../../src/address-integrity/assets.js";
 import { bitcoinReceived, bitcoinScript, solanaReceived } from "../../src/independent-reconciliation/chain-reads.js";
-import { BITCOIN_CONFIRMATION_TIERS, requiredConfirmations } from "../../src/spec-0.4.0-placeholder.js";
 
 const bytes32 = fc.uint8Array({ minLength: 32, maxLength: 32 });
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");

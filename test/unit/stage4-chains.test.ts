@@ -4,6 +4,14 @@
  * `nep141:sol-<hex(keccak256(mint)[12..32])>.omft.near`, the attested token reconciliation, R4 on
  * Solana/Bitcoin deposits, and sentinel's own reads of Solana and Bitcoin settlements.
  */
+
+import {
+  BITCOIN_CONFIRMATION_TIERS,
+  BITCOIN_MAINNET,
+  parseOmftAssetId,
+  requiredConfirmations,
+  SOLANA_MAINNET,
+} from "@nearpay/spec";
 import type { OneClickQuoteResponse } from "@nearpay-internal/spec";
 import { describe, expect, it } from "vitest";
 import {
@@ -18,13 +26,6 @@ import { ATTESTED_CHAINS, attestedChain } from "../../src/address-integrity/atte
 import { checkRouteQuote, type RouteQuoteInput } from "../../src/address-integrity/checks.js";
 import { bitcoinReceived, bitcoinScript, solanaReceived } from "../../src/independent-reconciliation/chain-reads.js";
 import { priceString, tokenMap } from "../../src/infra/clients/tokens.js";
-import {
-  BITCOIN_CONFIRMATION_TIERS,
-  BITCOIN_MAINNET,
-  parseOmftAssetId,
-  requiredConfirmations,
-  SOLANA_MAINNET,
-} from "../../src/spec-0.4.0-placeholder.js";
 import { fixture } from "../support/keys.js";
 import { specVector } from "../support/vectors.js";
 
@@ -75,7 +76,7 @@ const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
 describe("omft asset ids (vectors `omft`)", () => {
-  it("the placeholder parser matches every vector", () => {
+  it("the spec parser matches every vector", () => {
     for (const c of V.omft.cases) expect(parseOmftAssetId(c.asset_id), c.asset_id).toEqual(c.parsed);
   });
   it("assetShape agrees with the spec parser on chain and token", () => {
@@ -337,7 +338,7 @@ describe("Solana settlement read (vectors `evidence.solana`)", () => {
 });
 
 describe("Bitcoin settlement read (vectors `evidence.bitcoin`)", () => {
-  it("the placeholder tiers reproduce the vector tiers", () => {
+  it("the spec tiers reproduce the vector tiers", () => {
     expect(BITCOIN_CONFIRMATION_TIERS).toEqual(V.evidence.bitcoin.tiers);
     for (const r of V.evidence.bitcoin.required_confirmations)
       expect(requiredConfirmations(BITCOIN_CONFIRMATION_TIERS, BigInt(r.usd_micros))).toBe(r.confirmations);

@@ -6,6 +6,8 @@
  * Covers pass, short/failed (mismatch), not final (retry → unverifiable), double use, the confirmation
  * tier and fail-closed coverage (no reader → unverifiable + `audit_coverage_missing`, never Tier B).
  */
+
+import { BITCOIN_MAINNET, SOLANA_MAINNET } from "@nearpay/spec";
 import { newId } from "@nearpay-internal/ids";
 import type { Execution } from "@nearpay-internal/spec";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -13,7 +15,6 @@ import type { Sentinel } from "../../src/app/context.js";
 import { AUDIT_MAX_ATTEMPTS, AuditRetry, auditExecution } from "../../src/independent-reconciliation/auditor.js";
 import { bitcoinScript } from "../../src/independent-reconciliation/chain-reads.js";
 import { esploraReader, solanaReader } from "../../src/infra/clients/chains.js";
-import { BITCOIN_MAINNET, SOLANA_MAINNET } from "../../src/spec-0.4.0-placeholder.js";
 import { execution } from "../support/executions.js";
 import {
   FAKE_TOKENS,
