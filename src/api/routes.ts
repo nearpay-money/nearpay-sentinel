@@ -61,13 +61,23 @@ export function clientIp(
  * client sends in the body.
  */
 export function opsOperator(route: AnyRoute, principal: RequestContext["principal"], nowMs: number): Operator {
-  const p = principal as (RequestContext["principal"] & { ops_role?: string }) | null;
+  const p = principal as
+    | (RequestContext["principal"] & { ops_role?: string; ops_admins?: unknown; ops_auth_at?: unknown })
+    | null;
   if (p?.ptype !== "ops" || !isId("usr", p.sub))
     throw new ApiError("permission_denied", { message: "This route needs a console operator." });
   const role = p.ops_role;
   if ((role !== "ops" && role !== "ops_admin") || !(route.opsRoles ?? []).includes(role))
     throw new ApiError("permission_denied", { message: `Role ${role ?? "none"} may not call ${route.id}.` });
-  const op: Operator = { id: p.sub, role, stepUpUntil: p.step_up_until };
+  // identity-signed extra claims (adaptive two-person rule); anything malformed counts as absent (fail closed)
+  const int = (v: unknown) => (typeof v === "number" && Number.isInteger(v) && v >= 0 ? v : undefined);
+  const op: Operator = {
+    id: p.sub,
+    role,
+    stepUpUntil: p.step_up_until,
+    activeAdmins: int(p.ops_admins),
+    authAt: int(p.ops_auth_at),
+  };
   if (route.stepUp && !stepUpFresh(op, nowMs)) throw new ApiError("step_up_required");
   return op;
 }

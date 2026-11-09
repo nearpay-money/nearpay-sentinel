@@ -8,7 +8,7 @@
  */
 import { createServer as createHttpServer } from "node:http";
 import { type AddressInfo, createServer } from "node:net";
-import { publicJwk } from "@nearpay-internal/auth";
+import { type ClaimsInput, publicJwk } from "@nearpay-internal/auth";
 import { type Bus, connectBus, type Envelope, publish } from "@nearpay-internal/bus";
 import { createDb, type Database, migrate, sql } from "@nearpay-internal/db";
 import { newId, toUuid, uuidv7 } from "@nearpay-internal/ids";
@@ -20,7 +20,9 @@ import {
   type MockPeer,
   mintOpsToken,
   mintServiceToken,
+  mintTestToken,
   mockPeer,
+  opsClaims,
   provisionServiceDatabase,
   type Started,
   startNats,
@@ -205,6 +207,10 @@ export interface Stack {
     stepUp?: boolean;
     stepUpUntil?: number;
     scopes?: string[];
+    /** Claim `ops_admins` (active ops_admin operators); absent = not sent. */
+    opsAdmins?: number;
+    /** Claim `ops_auth_at` (unix seconds of the last user verification); absent = not sent. */
+    authAt?: number;
   }): Promise<string>;
   /** Another api process on the same databases with a config override (e.g. `env: "server"`). */
   extraApi(over: Partial<WorkerConfig>): Promise<{ call: Stack["call"]; stop(): Promise<void> }>;
@@ -298,6 +304,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     evmRpcUrls_8453: [],
     evmRpcUrls_42161: [],
     natsUrl: nats?.url ?? "nats://127.0.0.1:9",
+    opsSingleOperatorDelayS: 300,
     signingKeyPath: `/run/secrets/sentinel-${KID}.pem`,
     ...(valkey ? { valkeyUrl: valkey.url } : {}),
     ...(sandbox ? { sandboxBaseUrl: sandbox.url, sandboxSigningPubkey: sandbox.signingPubkey } : {}),
@@ -399,13 +406,21 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
       return { status: res.status, body: text ? JSON.parse(text) : undefined, headers: res.headers };
     },
     opsToken: (scopes = ["sentinel.killswitch"]) => mintOpsToken({ sub: OPS_CLI_OPERATOR, role: "ops", scopes }),
-    operatorToken: (t) =>
-      mintOpsToken({
+    operatorToken: (t) => {
+      const o = {
         sub: t.sub,
         role: t.role ?? "ops",
         ...(t.scopes ? { scopes: t.scopes } : {}),
         stepUp: t.stepUp === false ? false : t.stepUpUntil ? t.stepUpUntil - Math.floor(Date.now() / 1000) : true,
-      }),
+      } as const;
+      if (t.opsAdmins === undefined && t.authAt === undefined) return mintOpsToken(o);
+      // identity's extra claims of the adaptive two-person rule
+      return mintTestToken({
+        ...opsClaims(o),
+        ...(t.opsAdmins !== undefined ? { ops_admins: t.opsAdmins } : {}),
+        ...(t.authAt !== undefined ? { ops_auth_at: t.authAt } : {}),
+      } as ClaimsInput);
+    },
     async extraApi(over) {
       const { service } = createApi({ ...config, ...over } as WorkerConfig, {
         ...deps,

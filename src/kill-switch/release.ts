@@ -17,17 +17,22 @@ import {
   canApprove,
   canReject,
   canRequest,
+  DEFAULT_SINGLE_OPERATOR_POLICY,
   effectiveStatus,
+  madeBySingleOperator,
   type Operator,
   RELEASE_TTL_MS,
   type Refusal,
   type ReleaseRequest,
   releaseActor,
+  SINGLE_OPERATOR_REASON_MIN,
+  type SingleOperatorPolicy,
   type SwitchView,
+  singleOperatorAvailableAt,
   staleReason,
 } from "./two-person.js";
 
-type Ctx = Pick<Sentinel, "db" | "log" | "metrics" | "now">;
+type Ctx = Pick<Sentinel, "db" | "log" | "metrics" | "now"> & { readonly singleOperator?: SingleOperatorPolicy };
 export type OpsKillSwitch = z.infer<typeof OpsKillSwitchSchema>;
 
 type Outcome<T> = { readonly refusal: Refusal } | ({ readonly refusal?: undefined } & T);
@@ -45,6 +50,8 @@ interface Row {
   decision_note: string | null;
   expires_at: Date;
   switch_version: number;
+  requested_admins: number | null;
+  single_operator: boolean;
 }
 
 const unix = (d: Date) => Math.floor(d.getTime() / 1000);
@@ -56,15 +63,43 @@ function domain(r: Row): ReleaseRequest {
     status: r.status,
     requestedBy: fromUuid("usr", r.requested_by),
     requestedRole: r.requested_role,
+    requestedAtMs: r.requested_at.getTime(),
+    requestedAdmins: r.requested_admins,
     expiresAtMs: r.expires_at.getTime(),
     switchVersion: r.switch_version,
     decidedBy: r.decided_by ? fromUuid("usr", r.decided_by) : null,
   };
 }
 
+/**
+ * Extension of `OpsApproval` (an open object; not yet in the spec): present when the request was made on a
+ * single-operator platform (pending: when its requester may complete it) or was completed by its
+ * requester. Absent for two-person requests, so their response is unchanged.
+ */
+export interface SingleOperatorView {
+  readonly used: boolean;
+  readonly available_at: number | null;
+  readonly reason_min_length: number;
+}
+
 /** `OpsApproval` view of a release request (a pending request past its validity reads `expired`). */
-export function approvalView(r: Row, sw: SwitchView, nowMs: number): OpsApproval {
+export function approvalView(
+  r: Row,
+  sw: SwitchView,
+  nowMs: number,
+  policy: SingleOperatorPolicy = DEFAULT_SINGLE_OPERATOR_POLICY,
+): OpsApproval & { single_operator?: SingleOperatorView } {
+  const at = singleOperatorAvailableAt(domain(r), policy);
+  const single: SingleOperatorView | null =
+    r.single_operator || madeBySingleOperator(domain(r))
+      ? {
+          used: r.single_operator,
+          available_at: at === null || r.status !== "pending" ? null : Math.ceil(at / 1000),
+          reason_min_length: SINGLE_OPERATOR_REASON_MIN,
+        }
+      : null;
   return {
+    ...(single ? { single_operator: single } : {}),
     id: fromUuid("opa", r.id),
     object: "ops_approval",
     action: "kill_switch.release",
@@ -102,6 +137,7 @@ async function pendingRow(t: Tx | Ctx["db"], lock: boolean): Promise<Row | undef
 
 function refuse(r: Refusal): never {
   if (r.error === "state_conflict") throw new ApiError("state_conflict", { message: `${r.reason}.` });
+  if (r.error === "reason_required") throw ApiError.invalid(`${r.reason}.`, "note");
   // the catalogue message is "This approval needs a different approver: {reason}" — fill it
   if (r.error === "approver_conflict") throw new ApiError("approver_conflict", { params: { reason: r.reason } });
   // permission_denied's catalogue message has an {action} placeholder (step_up_required has none)
@@ -113,7 +149,7 @@ export async function opsKillSwitch(s: Ctx): Promise<OpsKillSwitch> {
   const st = await s.db.selectFrom("kill_switch").selectAll().where("id", "=", 1).executeTakeFirstOrThrow();
   const p = await pendingRow(s.db, false);
   const now = s.now();
-  const view = p ? approvalView(p, st, now) : null;
+  const view = p ? approvalView(p, st, now, s.singleOperator) : null;
   return stateView(st, view && view.status === "pending" ? view : null);
 }
 
@@ -158,7 +194,7 @@ export async function requestRelease(
       }
       const v = canRequest(op, sw, pending ? domain(pending) : null, reason, nowMs);
       if (!v.ok) return { refusal: v };
-      if (v.replay && pending) return { approval: approvalView(pending, sw, nowMs), replayed: true };
+      if (v.replay && pending) return { approval: approvalView(pending, sw, nowMs, s.singleOperator), replayed: true };
       const id = uuidv7();
       const row = await t
         .insertInto("release_requests")
@@ -171,10 +207,11 @@ export async function requestRelease(
           requested_at: new Date(nowMs),
           expires_at: new Date(nowMs + RELEASE_TTL_MS),
           switch_version: sw.version,
+          requested_admins: op.activeAdmins ?? null,
         })
         .returningAll()
         .executeTakeFirstOrThrow();
-      const approval = approvalView(row, sw, nowMs);
+      const approval = approvalView(row, sw, nowMs, s.singleOperator);
       await emit(t, {
         subject: "evt.sentinel.kill_switch.release_requested",
         aggregate: { type: "ops_approval", id: approval.id, version: 1 },
@@ -219,41 +256,59 @@ async function lockRequest(t: Tx, opa: string): Promise<Row> {
  * `POST /ops/kill_switch/release_requests/{id}/approve`: the second operator. In one transaction: request
  * `approved`, switch released (version + 1, log row with actor `<requester>+<approver>`, outbox `released`)
  * and the operator action. A request that is no longer valid is recorded `expired` and answered 409.
+ *
+ * Single-operator platform (one active `ops_admin` when requested and now): the requester may complete it
+ * under the single-operator guards (two-person.ts); the row is marked `single_operator`, the operator
+ * action is `kill_switch.release_approved_single_operator` and `nearpay_ops_single_operator_actions_total`
+ * counts it.
  */
 export async function approveRelease(s: Ctx, op: Operator, opa: string, note?: string): Promise<OpsKillSwitch> {
   const nowMs = s.now();
-  const out = await s.db.transaction().execute(async (t): Promise<Outcome<{ state: KillSwitchState }>> => {
-    const sw = await lockSwitch(t);
-    const row = await lockRequest(t, opa);
-    const v = canApprove(op, domain(row), sw, nowMs);
-    if (!v.ok) {
-      if (v.error === "state_conflict" && v.expire) await expire(t, row.id, v.reason);
-      return { refusal: v };
-    }
-    if (v.replay) return { state: sw };
-    await t
-      .updateTable("release_requests")
-      .set({
-        status: "approved",
-        decided_by: toUuid(op.id, "usr"),
-        decided_role: op.role,
-        decided_at: new Date(nowMs),
-        decision_note: note ? note.slice(0, 500) : null,
-      })
-      .where("id", "=", row.id)
-      .execute();
-    const actor = releaseActor(fromUuid("usr", row.requested_by), op.id);
-    const next = await setKillSwitch(s, false, row.reason, actor, t);
-    if (next.engaged || next.version !== sw.version + 1) throw new Error("release did not apply"); // rolls back
-    await recordOpsAction(t, {
-      actor: op,
-      action: "kill_switch.release_approved",
-      target: { type: "kill_switch", id: KILL_SWITCH_ID },
-      approval: row.id,
+  const policy = s.singleOperator ?? DEFAULT_SINGLE_OPERATOR_POLICY;
+  const out = await s.db
+    .transaction()
+    .execute(async (t): Promise<Outcome<{ state: KillSwitchState; single: boolean }>> => {
+      const sw = await lockSwitch(t);
+      const row = await lockRequest(t, opa);
+      const v = canApprove(op, domain(row), sw, nowMs, policy, note);
+      if (!v.ok) {
+        if (v.error === "state_conflict" && v.expire) await expire(t, row.id, v.reason);
+        return { refusal: v };
+      }
+      if (v.replay) return { state: sw, single: false };
+      const single = v.singleOperator === true;
+      await t
+        .updateTable("release_requests")
+        .set({
+          status: "approved",
+          decided_by: toUuid(op.id, "usr"),
+          decided_role: op.role,
+          decided_at: new Date(nowMs),
+          decision_note: note ? note.slice(0, 500) : null,
+          single_operator: single,
+        })
+        .where("id", "=", row.id)
+        .execute();
+      const actor = releaseActor(fromUuid("usr", row.requested_by), op.id);
+      const next = await setKillSwitch(s, false, row.reason, actor, t);
+      if (next.engaged || next.version !== sw.version + 1) throw new Error("release did not apply"); // rolls back
+      await recordOpsAction(t, {
+        actor: op,
+        action: single ? "kill_switch.release_approved_single_operator" : "kill_switch.release_approved",
+        target: { type: "kill_switch", id: KILL_SWITCH_ID },
+        approval: row.id,
+        ...(single ? { singleOperator: true } : {}),
+      });
+      return { state: next, single };
     });
-    return { state: next };
-  });
   if (out.refusal) refuse(out.refusal);
+  if (out.single) {
+    s.metrics.singleOperatorAction("kill_switch.release");
+    s.log.warn(
+      { operator: op.id, approval: opa, single_operator: true },
+      "ALERT kill-switch released by a single operator (one active ops_admin)",
+    );
+  }
   return stateView(out.state, null);
 }
 
@@ -268,7 +323,7 @@ export async function rejectRelease(s: Ctx, op: Operator, opa: string, note: str
       if (v.error === "state_conflict" && v.expire) await expire(t, row.id, v.reason);
       return { refusal: v };
     }
-    if (v.replay) return { approval: approvalView(row, sw, nowMs) };
+    if (v.replay) return { approval: approvalView(row, sw, nowMs, s.singleOperator) };
     const updated = await t
       .updateTable("release_requests")
       .set({
@@ -288,7 +343,7 @@ export async function rejectRelease(s: Ctx, op: Operator, opa: string, note: str
       target: { type: "kill_switch", id: KILL_SWITCH_ID },
       approval: row.id,
     });
-    return { approval: approvalView(updated, sw, nowMs) };
+    return { approval: approvalView(updated, sw, nowMs, s.singleOperator) };
   });
   if (out.refusal) refuse(out.refusal);
   return out.approval;

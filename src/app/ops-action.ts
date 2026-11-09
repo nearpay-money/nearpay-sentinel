@@ -24,6 +24,12 @@ export interface OpsActionInput {
   readonly livemode?: boolean | null;
   /** Two-person approval (uuid) the action completed or belongs to, if any. */
   readonly approval?: string | null;
+  /**
+   * The requester completed a two-person action alone (single-operator platform). Published as
+   * `single_operator: true` on the event object (an extra field of the open `OpsActionEvent`); identity
+   * keeps it in the audit event's details.
+   */
+  readonly singleOperator?: boolean;
 }
 
 export async function recordOpsAction(tx: Tx, a: OpsActionInput): Promise<string> {
@@ -48,6 +54,7 @@ export async function recordOpsAction(tx: Tx, a: OpsActionInput): Promise<string
         account_id: a.accountId ?? null,
         approval: a.approval ? fromUuid("opa", a.approval) : null,
         occurred_at: at.toISOString(),
+        ...(a.singleOperator ? { single_operator: true } : {}),
       },
     },
   });

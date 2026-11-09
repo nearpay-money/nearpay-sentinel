@@ -1,4 +1,4 @@
-/** Kysely table types (migrations/0001_sentinel.sql, 0002_two_person_release.sql, 0003_account_names.sql) and identity's registry view (read-only role). */
+/** Kysely table types (migrations/0001_sentinel.sql, 0002_two_person_release.sql, 0003_account_names.sql, 0004_single_operator.sql) and identity's registry view (read-only role). */
 import type { ColumnType, KitTables } from "@nearpay-internal/db";
 
 type Timestamp = ColumnType<Date, Date | string | undefined, Date | string>;
@@ -75,6 +75,10 @@ export interface ReleaseRequestsTable {
   decision_note: Opt<string>;
   expires_at: ColumnType<Date, Date | string, Date | string>;
   switch_version: number;
+  /** Migration 0004: active `ops_admin` operators when requested (null: unknown → two-person). */
+  requested_admins: Opt<number>;
+  /** Migration 0004: approved by its requester on a single-operator platform. */
+  single_operator: ColumnType<boolean, boolean | undefined, boolean>;
 }
 
 /** Display names of accounts (spec 0.2.1), from `evt.identity.account.*`; stale versions are ignored. */

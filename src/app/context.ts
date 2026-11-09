@@ -11,6 +11,7 @@ import type { EsploraReader, EvmReader, NearReader, SolanaReader } from "../infr
 import type { SandboxStatus, StatusProvider } from "../infra/clients/providers.js";
 import type { TokenRegistry } from "../infra/clients/tokens.js";
 import type { DB, RegistryDB } from "../infra/db/schema.js";
+import type { SingleOperatorPolicy } from "../kill-switch/two-person.js";
 
 export type Tx = Transaction<DB>;
 
@@ -20,12 +21,24 @@ export interface SentinelMetrics {
   killSwitch(engaged: boolean): void;
   /** An audit on a Stage 4 chain had no sentinel reader configured (§16 `audit_coverage_missing{chain}`). */
   coverageMissing(chain: string): void;
+  /** `nearpay_ops_single_operator_actions_total{action}` (app/single-operator-metrics.ts). */
+  singleOperatorAction(action: string): void;
 }
 
-export const noMetrics: SentinelMetrics = { attestation() {}, finding() {}, killSwitch() {}, coverageMissing() {} };
+export const noMetrics: SentinelMetrics = {
+  attestation() {},
+  finding() {},
+  killSwitch() {},
+  coverageMissing() {},
+  singleOperatorAction() {},
+};
 
 /** Service metrics (§12). The kill-switch gauge is read from the database on every scrape. */
-export function sentinelMetrics(m: ServiceMetrics, engaged?: () => Promise<boolean>): SentinelMetrics {
+export function sentinelMetrics(
+  m: ServiceMetrics,
+  engaged?: () => Promise<boolean>,
+  singleOperatorAction: (action: string) => void = () => {},
+): SentinelMetrics {
   const att = m.counter("attestations_total", "Co-signing requests by outcome.", ["kind", "result", "reason"]);
   const dur = m.histogram(
     "attestation_duration_seconds",
@@ -57,6 +70,7 @@ export function sentinelMetrics(m: ServiceMetrics, engaged?: () => Promise<boole
     finding: (result) => findings.inc({ result }),
     killSwitch: (on) => ks.set(on ? 1 : 0),
     coverageMissing: (chain) => coverage.inc({ chain }),
+    singleOperatorAction,
   };
 }
 
@@ -150,6 +164,8 @@ export interface Sentinel {
   readonly bitcoin: EsploraReader | null;
   readonly auditSampleRate: number;
   readonly auditAlwaysUsdMicros: bigint;
+  /** Adaptive two-person rule: wait before a single operator completes their own request (`NP_OPS_SINGLE_OPERATOR_DELAY_S`). */
+  readonly singleOperator: SingleOperatorPolicy;
   readonly random: () => number;
   readonly now: () => number;
 }
