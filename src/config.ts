@@ -97,6 +97,12 @@ const shared = {
   bitcoinEsploraUrls: rpcList().optional(),
   sentinelSolanaRpcUrls: ownRpcList(),
   sentinelBitcoinEsploraUrls: ownRpcList(),
+  /**
+   * Single-operator platforms (§6, adaptive two-person rule): the wait after a release request before its
+   * requester may complete it alone, seconds — ≥ 1 (0 is not allowed for the kill-switch release), below
+   * the 1 h expiry.
+   */
+  opsSingleOperatorDelayS: z.coerce.number().int().min(1).max(3000).default(300),
 };
 
 export const apiShape = { ...shared };

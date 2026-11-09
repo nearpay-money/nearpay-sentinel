@@ -28,6 +28,8 @@ const req = (o: Partial<ReleaseRequest> = {}): ReleaseRequest => ({
   status: "pending",
   requestedBy: "usr_alice",
   requestedRole: "ops",
+  requestedAtMs: NOW,
+  requestedAdmins: null,
   expiresAtMs: NOW + RELEASE_TTL_MS,
   switchVersion: 4,
   decidedBy: null,

@@ -70,6 +70,7 @@ import {
   type Sentinel,
   sentinelMetrics,
 } from "./context.js";
+import { logSingleOperatorPolicy, registerSingleOperatorCounter } from "./single-operator-metrics.js";
 
 /** `GET /v1/attestations/keys` when no retirement is scheduled. */
 export const NO_RETIREMENT = "9999-12-31T23:59:59.000Z";
@@ -194,6 +195,7 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
           : null,
     auditSampleRate: config.auditSampleRate,
     auditAlwaysUsdMicros: BigInt(Math.round(config.auditAlwaysUsd * 1_000_000)),
+    singleOperator: { delayMs: (config.opsSingleOperatorDelayS ?? 300) * 1000 },
     random: deps.random ?? Math.random,
     now: deps.now ?? Date.now,
   };
@@ -214,7 +216,12 @@ function readiness(b: Built) {
 
 function attach(b: Built, service: Service, deps: ServiceDeps) {
   b.sentinel.log = service.log;
-  b.sentinel.metrics = sentinelMetrics(service.metrics, async () => (await killSwitchState(b.sentinel)).engaged);
+  logSingleOperatorPolicy(service.log, b.sentinel.singleOperator.delayMs / 1000);
+  b.sentinel.metrics = sentinelMetrics(
+    service.metrics,
+    async () => (await killSwitchState(b.sentinel)).engaged,
+    registerSingleOperatorCounter(service.metrics),
+  );
   service.onShutdown(async () => {
     if (!deps.cache) await b.sentinel.cache.close();
     if (!deps.registry) await b.registry.close();

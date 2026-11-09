@@ -620,3 +620,128 @@ describe("account display names on findings (spec 0.2.1)", () => {
     expect(row).toMatchObject({ display_name: "Acme GmbH", version: 3 });
   });
 });
+
+describe("adaptive two-person rule: single-operator platform (one active ops_admin)", () => {
+  const REASON = "only operator of the platform; incident 42 resolved";
+  const sec = () => Math.floor((Date.now() + offsetMs) / 1000);
+  /** Token of bob with identity's count claim and a user verification `authAgoS` seconds ago (service clock). */
+  const tokOf = (opsAdmins: number | undefined, authAgoS = 0) =>
+    s.operatorToken({
+      sub: bob,
+      role: "ops_admin",
+      stepUpUntil: sec() - authAgoS + 600,
+      ...(opsAdmins !== undefined ? { opsAdmins } : {}),
+      authAt: sec() - authAgoS,
+    });
+  const approve = async (opa: string, token: string, note?: string) =>
+    s.call("POST", `/ops/kill_switch/release_requests/${opa}/approve`, {
+      token,
+      body: note === undefined ? {} : { note },
+    });
+  const requestAs = async (opsAdmins: number | undefined) =>
+    s.call("POST", "/ops/kill_switch/release_requests", {
+      token: await tokOf(opsAdmins),
+      body: { reason: "root cause fixed" },
+    });
+
+  it("the only operator completes it after the wait, with a new confirmation and a reason; marked single_operator", async () => {
+    const on = await engage();
+    const req = await requestAs(1);
+    expect(req.status).toBe(201);
+    const a = req.body as { id: string; requested_at: number; single_operator: Record<string, unknown> };
+    expect(a.single_operator).toMatchObject({ used: false, reason_min_length: 20 });
+    // the request time is shown in whole seconds; the wait ends 300 s after the exact request time
+    expect((a.single_operator.available_at as number) - a.requested_at).toBeGreaterThanOrEqual(300);
+    expect((a.single_operator.available_at as number) - a.requested_at).toBeLessThanOrEqual(301);
+
+    // before the wait: refused, nothing changes
+    const early = await approve(a.id, await tokOf(1), REASON);
+    expect(early.status).toBe(403);
+    expect((early.body as { error: { code: string } }).error.code).toBe("approver_conflict");
+
+    offsetMs = 301_000;
+    // a confirmation from before the wait ended does not count, even while its step-up is still fresh
+    const stale = await approve(a.id, await tokOf(1, 10), REASON);
+    expect(stale.status).toBe(401);
+    expect((stale.body as { error: { code: string } }).error.code).toBe("step_up_required");
+    // no written reason
+    const bare = await approve(a.id, await tokOf(1), "ok");
+    expect(bare.status).toBe(400);
+    expect((await outbox()).filter((e) => e.subject === "evt.sentinel.kill_switch.released")).toEqual([]);
+
+    const ok = await approve(a.id, await tokOf(1), REASON);
+    expect(ok.status).toBe(200);
+    expect(ok.body).toMatchObject({ engaged: false, actor: `${bob}+${bob}`, version: on.version + 1 });
+    const row = await s.admin.db
+      .selectFrom("release_requests")
+      .selectAll()
+      .where("id", "=", toUuid(a.id, "opa"))
+      .executeTakeFirstOrThrow();
+    expect(row).toMatchObject({
+      status: "approved",
+      single_operator: true,
+      requested_admins: 1,
+      decision_note: REASON,
+    });
+    expect(row.decided_by).toBe(row.requested_by); // the first step still names who started it
+    const action = (await outbox()).filter((e) => e.subject === "evt.sentinel.ops_action.recorded").at(-1);
+    expect(action?.payload.data.object).toMatchObject({
+      action: "kill_switch.release_approved_single_operator",
+      actor: { sub: bob, ops_role: "ops_admin" },
+      approval: a.id,
+      single_operator: true,
+    });
+  });
+
+  it("two or more approvers when requested: the requester stays refused even if the other is revoked mid-action", async () => {
+    await engage();
+    const a = (await requestAs(2)).body as { id: string };
+    expect(a).not.toHaveProperty("single_operator");
+    offsetMs = 301_000;
+    // the count dropped to one (the other operator was disabled), but the request was made with two
+    const self = await approve(a.id, await tokOf(1), REASON);
+    expect(self.status).toBe(403);
+    expect((self.body as { error: { code: string } }).error.code).toBe("approver_conflict");
+  });
+
+  it("a second operator added after the request turns the two-person rule back on", async () => {
+    await engage();
+    const a = (await requestAs(1)).body as { id: string };
+    offsetMs = 301_000;
+    const self = await approve(a.id, await tokOf(2), REASON);
+    expect(self.status).toBe(403);
+    expect((self.body as { error: { code: string } }).error.code).toBe("approver_conflict");
+    // and the new operator approves as usual
+    const other = await approve(
+      a.id,
+      await s.operatorToken({ sub: carol, role: "ops_admin", opsAdmins: 2, authAt: sec() }),
+    );
+    expect(other.status).toBe(200);
+  });
+
+  it("without identity's count claim the two-person rule applies (fail closed)", async () => {
+    await engage();
+    const a = (await requestAs(undefined)).body as { id: string };
+    offsetMs = 301_000;
+    expect((await approve(a.id, await tokOf(undefined), REASON)).status).toBe(403);
+    expect((await approve(a.id, await tokOf(1), REASON)).status).toBe(403);
+  });
+
+  it("the database refuses an unmarked same-operator approval, a marker on a two-person request and one without a reason", async () => {
+    await engage();
+    const one = toUuid(((await requestAs(1)).body as { id: string }).id, "opa");
+    const approveSql = (id: string, extra: ReturnType<typeof sql>) =>
+      sql`update release_requests set status = 'approved', decided_by = requested_by, decided_role = 'ops_admin',
+          decided_at = now() + interval '1 second', ${extra} where id = ${id}`.execute(s.admin.db);
+    await expect(approveSql(one, sql`decision_note = 'a reason'`)).rejects.toThrow(/release_approver_differs/);
+    await expect(approveSql(one, sql`single_operator = true`)).rejects.toThrow(/release_approver_differs/);
+    await sql`update release_requests set status = 'expired' where id = ${one}`.execute(s.admin.db);
+    const two = toUuid(((await requestAs(2)).body as { id: string }).id, "opa");
+    await expect(approveSql(two, sql`single_operator = true, decision_note = 'a reason'`)).rejects.toThrow(
+      /release_approver_differs/,
+    );
+    await expect(
+      sql`update release_requests set requested_admins = 1 where id = ${two}`.execute(s.admin.db),
+    ).rejects.toThrow(/may only be decided/);
+  });
+});
