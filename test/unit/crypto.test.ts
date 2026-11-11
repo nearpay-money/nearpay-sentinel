@@ -3,7 +3,7 @@
  * (tickets) and checkout (attestations): the same bytes, keys and signatures in every repo (§13).
  */
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import type { SignedAttestation } from "@nearpay/spec";
+import type { SignedAttestation } from "@nearpay-money/spec";
 import { describe, expect, it } from "vitest";
 import {
   ed25519PublicKey,

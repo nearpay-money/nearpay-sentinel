@@ -5,7 +5,6 @@
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { Evidence, PUBLIC_ROUTES, SPEC_VERSION } from "@nearpay/spec";
 import { unhandledSubjects } from "@nearpay-internal/bus";
 import { unimplementedRoutes } from "@nearpay-internal/service";
 import {
@@ -16,6 +15,7 @@ import {
   SUBJECTS,
   type Subject,
 } from "@nearpay-internal/spec";
+import { Evidence, PUBLIC_ROUTES, SPEC_VERSION } from "@nearpay-money/spec";
 import { describe, expect, it } from "vitest";
 import { sentinelRoutes } from "../../src/api/routes.js";
 import { sentinelHandlers } from "../../src/consumers/handlers.js";
@@ -74,7 +74,7 @@ describe("provider wire schemas", () => {
 
 describe("spec 0.4.0 (Stage 4 chains, lld/sentinel.md §16)", () => {
   it("is built against spec 0.4.0; Stage 4 adds no sentinel route", () => {
-    expect(SPEC_VERSION).toBe("0.4.0");
+    expect(SPEC_VERSION).toBe("0.5.0"); // public package renamed to @nearpay-money/spec (0.5.0 = 0.4.2 contracts)
     expect(SPEC_INTERNAL_VERSION).toBe("0.4.0");
     expect(ALL.filter((r) => r.service === "sentinel" && r.stage > 2).map((r) => r.id)).toEqual([]);
   });

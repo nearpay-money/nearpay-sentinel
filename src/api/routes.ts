@@ -5,7 +5,6 @@
  * enforce `opsRoles` / ops step-up yet).
  */
 
-import { type AnyRoute, createDepositInstructionsAttestation, listAttestationKeys } from "@nearpay/spec";
 import { isId } from "@nearpay-internal/ids";
 import { ApiError, implement, type RequestContext, type RouteBinding } from "@nearpay-internal/service";
 import {
@@ -21,6 +20,7 @@ import {
   requestOpsKillSwitchRelease,
   setKillSwitch as setKillSwitchRoute,
 } from "@nearpay-internal/spec";
+import { type AnyRoute, createDepositInstructionsAttestation, listAttestationKeys } from "@nearpay-money/spec";
 import type { Sentinel } from "../app/context.js";
 import { attest } from "../co-signer/attest.js";
 import { acknowledgeFinding, getFinding, listFindings } from "../independent-reconciliation/findings.js";

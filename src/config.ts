@@ -1,7 +1,7 @@
 /** Configuration (lld/sentinel.md §10, foundations §13). */
 
-import { NearAccountId } from "@nearpay/spec";
 import { baseConfigShape, list, loadConfig, secret, url } from "@nearpay-internal/service";
+import { NearAccountId } from "@nearpay-money/spec";
 import { z } from "zod";
 import { CLIENT_IP_HEADERS } from "./api/client-ip.js";
 

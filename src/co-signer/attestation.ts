@@ -5,8 +5,9 @@
  * display data and token contract from sentinel's own token-registry read (CR-15-07, spec 0.2.1) — never
  * from the request, rails or the payer.
  */
-import type { Attestation } from "@nearpay/spec";
+
 import { destinationFingerprint } from "@nearpay-internal/chains";
+import type { Attestation } from "@nearpay-money/spec";
 import type { RegistryRow } from "../address-integrity/checks.js";
 
 export interface AttestationInput {

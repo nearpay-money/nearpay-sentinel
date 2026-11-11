@@ -7,7 +7,7 @@
  *   base64url without padding; `kid` names the key checkout pins.
  */
 import { createHash, createPrivateKey, createPublicKey, type KeyObject, sign, verify } from "node:crypto";
-import { type Attestation, AttestationTicketPayload, type SignedAttestation } from "@nearpay/spec";
+import { type Attestation, AttestationTicketPayload, type SignedAttestation } from "@nearpay-money/spec";
 import canonicalize from "canonicalize";
 
 export function jcs(v: unknown): string {

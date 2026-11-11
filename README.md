@@ -55,7 +55,7 @@ nearpay-sentinel/
 
 | Command                                                                                                     | What it does                                                                                                                                                        |
 | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pnpm install`                                                                                              | Install (Node 22, pnpm 9); `@nearpay/*` and `@nearpay-internal/*` come from the local registry (`.npmrc`, `nearpay-deploy/scripts/up.sh` starts it)                 |
+| `pnpm install`                                                                                              | Install (Node 22, pnpm 9); `@nearpay-money/*` and `@nearpay-internal/*` come from the local registry (`.npmrc`, `nearpay-deploy/scripts/up.sh` starts it)           |
 | `pnpm test`                                                                                                 | Unit and property tests                                                                                                                                             |
 | `pnpm test:integration`                                                                                     | Integration and contract tests: Postgres, NATS, Valkey, Anvil and the `nearpay/sandbox:local` image in Testcontainers (needs Docker; build the sandbox image first) |
 | `pnpm verify`                                                                                               | typecheck + lint + unit tests with the coverage gate (≥ 90 % branches on the pure rules) + integration tests + build                                                |
@@ -100,7 +100,7 @@ docker compose -p nearpay exec sentinel-api /nodejs/bin/node dist/ops.js kill-sw
 
 ## Status
 
-Stage 2 (step 2.2) implemented against `@nearpay/spec` / `@nearpay-internal/spec` 0.2.0 and kit 0.2.0: console routes (kill switch, two-person release, log, findings), operator-action events, attested origin asset (CR-15-07), refund-leg audit; the Stage 1 1Click body normalisation is gone (spec transcribes the live shape).
+Stage 2 (step 2.2) implemented against `@nearpay-money/spec` / `@nearpay-internal/spec` 0.2.0 and kit 0.2.0: console routes (kill switch, two-person release, log, findings), operator-action events, attested origin asset (CR-15-07), refund-leg audit; the Stage 1 1Click body normalisation is gone (spec transcribes the live shape).
 
 ## Built with
 

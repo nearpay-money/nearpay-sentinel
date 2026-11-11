@@ -4,11 +4,11 @@
  * separately. Acknowledgement writes the finding row and the operator action in one transaction.
  */
 
-import type { RouteQuery } from "@nearpay/spec";
 import { sql } from "@nearpay-internal/db";
 import { fromUuid, isId, toUuid } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import type { listOpsFindings, OpsAuditFinding } from "@nearpay-internal/spec";
+import type { RouteQuery } from "@nearpay-money/spec";
 import type { z } from "zod";
 import type { Sentinel } from "../app/context.js";
 import { type OpsActor, recordOpsAction } from "../app/ops-action.js";
