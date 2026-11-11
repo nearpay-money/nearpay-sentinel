@@ -33,9 +33,9 @@ export function mintTicket(
 
 const require = createRequire(import.meta.url);
 
-/** A spec test vector (`@nearpay/spec/test-vectors/<name>.json`). */
+/** A spec test vector (`@nearpay-money/spec/test-vectors/<name>.json`). */
 export function vector<T = unknown>(name: string): T {
-  return JSON.parse(readFileSync(require.resolve(`@nearpay/spec/test-vectors/${name}.json`), "utf8")) as T;
+  return JSON.parse(readFileSync(require.resolve(`@nearpay-money/spec/test-vectors/${name}.json`), "utf8")) as T;
 }
 
 export const fixture = <T = unknown>(path: string): T =>

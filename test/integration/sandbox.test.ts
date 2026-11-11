@@ -4,9 +4,10 @@
  * the auditor verifies the simulated destination chain; an Intents-transfer requirement is co-signed for
  * the test treasury.
  */
-import { routeQuoteDepositKey, SignedAttestation } from "@nearpay/spec";
+
 import { newId } from "@nearpay-internal/ids";
 import { type Execution, OneClickQuoteResponse, OneClickStatusResponse } from "@nearpay-internal/spec";
+import { routeQuoteDepositKey, SignedAttestation } from "@nearpay-money/spec";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Sentinel } from "../../src/app/context.js";
 import { verifyAttestation } from "../../src/co-signer/crypto.js";

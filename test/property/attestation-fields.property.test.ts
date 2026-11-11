@@ -5,7 +5,7 @@
  * `Attestation`, and verifies once signed. And a full-precision `amountInFormatted` pins the decimals.
  * Spec 0.2.1: the attested token contract never names a contract other than the one the asset id names.
  */
-import { Attestation } from "@nearpay/spec";
+import { Attestation } from "@nearpay-money/spec";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { assetShape, formattedMatches, reconcileToken } from "../../src/address-integrity/assets.js";

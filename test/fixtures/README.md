@@ -12,4 +12,4 @@ Public responses recorded from mainnet services (copied from nearpay-rails' fixt
 
 Live 1Click statuses with deposit addresses are built by the signed 1Click double (`test/support/fakes.ts`):
 a live deposit cannot be recorded without moving funds. The attestation and ticket vectors come from
-`@nearpay/spec/test-vectors` (shared with payments and checkout).
+`@nearpay-money/spec/test-vectors` (shared with payments and checkout).

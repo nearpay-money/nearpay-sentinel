@@ -4,7 +4,7 @@
  * nothing else; the confirmation tier never weakens as the value grows.
  */
 
-import { BITCOIN_CONFIRMATION_TIERS, requiredConfirmations } from "@nearpay/spec";
+import { BITCOIN_CONFIRMATION_TIERS, requiredConfirmations } from "@nearpay-money/spec";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import bs58 from "bs58";
 import fc from "fast-check";

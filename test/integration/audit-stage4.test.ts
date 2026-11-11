@@ -7,9 +7,9 @@
  * tier and fail-closed coverage (no reader → unverifiable + `audit_coverage_missing`, never Tier B).
  */
 
-import { BITCOIN_MAINNET, SOLANA_MAINNET } from "@nearpay/spec";
 import { newId } from "@nearpay-internal/ids";
 import type { Execution } from "@nearpay-internal/spec";
+import { BITCOIN_MAINNET, SOLANA_MAINNET } from "@nearpay-money/spec";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Sentinel } from "../../src/app/context.js";
 import { AUDIT_MAX_ATTEMPTS, AuditRetry, auditExecution } from "../../src/independent-reconciliation/auditor.js";

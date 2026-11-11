@@ -4,11 +4,12 @@
  * (spoof counting and rate limit, kill switch only for a live address rails confirms, page when rails is
  * unreachable), the registry outage path, keys and the ops kill switch.
  */
-import { routeQuoteDepositKey, SignedAttestation } from "@nearpay/spec";
+
 import { destinationFingerprint } from "@nearpay-internal/chains";
 import { sql } from "@nearpay-internal/db";
 import { newId, toUuid } from "@nearpay-internal/ids";
 import type { OneClickQuoteResponse } from "@nearpay-internal/spec";
+import { routeQuoteDepositKey, SignedAttestation } from "@nearpay-money/spec";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { NO_RETIREMENT } from "../../src/app/services.js";
 import { resetSpoofCounters } from "../../src/co-signer/attest.js";

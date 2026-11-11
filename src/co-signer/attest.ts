@@ -5,10 +5,10 @@
  * NearPay issued engages the kill switch (L-SN-01); spoofs are refused, counted and rate-limited.
  */
 
-import type { createDepositInstructionsAttestation } from "@nearpay/spec";
-import { routeQuoteDepositKey, type SignedAttestation } from "@nearpay/spec";
 import { uuidv7 } from "@nearpay-internal/ids";
 import { ApiError, type RouteBodyOut } from "@nearpay-internal/service";
+import type { createDepositInstructionsAttestation } from "@nearpay-money/spec";
+import { routeQuoteDepositKey, type SignedAttestation } from "@nearpay-money/spec";
 import { attestedAsset } from "../address-integrity/assets.js";
 import { type CheckFailure, checkIntents, checkRouteQuote, type RegistryRow } from "../address-integrity/checks.js";
 import type { Sentinel } from "../app/context.js";

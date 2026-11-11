@@ -2,7 +2,7 @@
  * Property (§13): any mutation of a signed attestation fails checkout's verification — any field,
  * any value, added or removed — while key order and re-serialisation never matter (RFC 8785).
  */
-import type { SignedAttestation } from "@nearpay/spec";
+import type { SignedAttestation } from "@nearpay-money/spec";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { jcs, loadSigningKey, signAttestation, verifyAttestation } from "../../src/co-signer/crypto.js";

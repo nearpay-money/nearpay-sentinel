@@ -5,14 +5,15 @@
  * Solana/Bitcoin deposits, and sentinel's own reads of Solana and Bitcoin settlements.
  */
 
+import type { OneClickQuoteResponse } from "@nearpay-internal/spec";
 import {
   BITCOIN_CONFIRMATION_TIERS,
+  BITCOIN_DEFAULT_CONFIRMATION_TIERS,
   BITCOIN_MAINNET,
   parseOmftAssetId,
   requiredConfirmations,
   SOLANA_MAINNET,
-} from "@nearpay/spec";
-import type { OneClickQuoteResponse } from "@nearpay-internal/spec";
+} from "@nearpay-money/spec";
 import { describe, expect, it } from "vitest";
 import {
   assetChain,
@@ -338,10 +339,17 @@ describe("Solana settlement read (vectors `evidence.solana`)", () => {
 });
 
 describe("Bitcoin settlement read (vectors `evidence.bitcoin`)", () => {
-  it("the spec tiers reproduce the vector tiers", () => {
-    expect(BITCOIN_CONFIRMATION_TIERS).toEqual(V.evidence.bitcoin.tiers);
+  // Since spec 0.4.2 (ADR-0022 as amended) the vectors carry the default tiers (1 confirmation for every amount);
+  // sentinel's independent audit deliberately stays on the stricter USD tiers (spec: "kept unchanged … for
+  // sentinel's stricter independent audit").
+  it("the spec default tiers reproduce the vector tiers", () => {
+    expect(BITCOIN_DEFAULT_CONFIRMATION_TIERS).toEqual(V.evidence.bitcoin.tiers);
     for (const r of V.evidence.bitcoin.required_confirmations)
-      expect(requiredConfirmations(BITCOIN_CONFIRMATION_TIERS, BigInt(r.usd_micros))).toBe(r.confirmations);
+      expect(requiredConfirmations(BITCOIN_DEFAULT_CONFIRMATION_TIERS, BigInt(r.usd_micros))).toBe(r.confirmations);
+  });
+  it("the audit's stricter tiers still ask 2 confirmations from USD 1,000", () => {
+    expect(requiredConfirmations(BITCOIN_CONFIRMATION_TIERS, 999_999_999n)).toBe(1);
+    expect(requiredConfirmations(BITCOIN_CONFIRMATION_TIERS, 1_000_000_000n)).toBe(2);
   });
   for (const c of V.evidence.bitcoin.cases)
     it(c.name, () => {
@@ -349,7 +357,7 @@ describe("Bitcoin settlement read (vectors `evidence.bitcoin`)", () => {
       const read = bitcoinReceived(c.esplora_tx, c.tip_height, recipient, c.esplora_tx.txid);
       expect(read).not.toBeNull();
       if (!read) return;
-      const required = requiredConfirmations(BITCOIN_CONFIRMATION_TIERS, BigInt(c.settlement_usd_micros));
+      const required = requiredConfirmations(BITCOIN_DEFAULT_CONFIRMATION_TIERS, BigInt(c.settlement_usd_micros));
       const final = read.confirmations >= required;
       expect(final).toBe(c.result === "pass");
       if (c.result === "pass") {

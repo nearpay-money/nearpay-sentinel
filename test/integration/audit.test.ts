@@ -5,10 +5,11 @@
  * for the destination check, and the worker end to end over NATS (settled → audit job → finding event;
  * destination disabled → cache eviction; kill-switch events relayed).
  */
-import { routeQuoteDepositKey } from "@nearpay/spec";
+
 import { fromUuid, newId, toUuid } from "@nearpay-internal/ids";
 import { AuditFinding, type Execution, KillSwitchEvent, OpsActionEvent, OpsApproval } from "@nearpay-internal/spec";
 import { domainEvent, internalSettlementDestination } from "@nearpay-internal/testing";
+import { routeQuoteDepositKey } from "@nearpay-money/spec";
 import { Redis } from "ioredis";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Sentinel } from "../../src/app/context.js";
