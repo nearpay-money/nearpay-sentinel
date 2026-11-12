@@ -15,20 +15,34 @@
  *   release it (the two-person / single-operator release): a corroborated breach is a security event.
  *
  * Quarantines expire on their own; ops list, extend and clear them with the CLI (src/ops/cli.ts).
+ *
+ * Amended 2026-11-12 (SENTINEL-1/2/7):
+ * - a quarantine in force is not extended by further breaches (payers retrying the same broken quote);
+ * - a breach that is provider-wide drift (`driftSignatures`: the same format/semantics refusal on ≥ 2 merchants)
+ *   is recorded with `drift = true`, quarantines nobody, raises no per-merchant audit finding, never counts
+ *   toward the systemic rule, and lifts the quarantines the earlier refusals of the same drift created
+ *   (`ALERT`-level log + `integrity_drift_total{source="pattern"}`);
+ * - when the systemic rule engages on refusals that all share one rule set, the engagement also reports
+ *   `integrity_drift_total{source="engaged"}` (likely a provider change or config skew; the switch still engages);
+ * - a breach with no known account counts as a refusal, never as an account.
  */
 import { emit, sql } from "@nearpay-internal/db";
 import { fromUuid, isId, toUuid, uuidv7 } from "@nearpay-internal/ids";
 import type { Evidence } from "../address-integrity/checks.js";
 import {
   type Breach,
+  driftSignature,
+  isDrift,
   quarantineExpiry,
   quarantineState,
   rulesOf,
   type SystemicVerdict,
+  stillPipelineBreach,
   systemicVerdict,
 } from "../address-integrity/containment.js";
 import type { Sentinel, Tx } from "../app/context.js";
 import { setKillSwitch } from "./kill-switch.js";
+import { clearSentinelQuarantines, quarantineLog as log } from "./quarantine-clear.js";
 
 /** What rails answered about the deposit address (scoping only, never a verdict). */
 export interface DepositLookup {
@@ -58,35 +72,50 @@ export interface Containment {
   readonly until: Date | null;
   readonly verdict: SystemicVerdict | null;
   readonly engaged: boolean;
+  /** The breach is provider-wide drift (SENTINEL-1): not contained, not counted. */
+  readonly drift: boolean;
 }
 
 const SYSTEMIC_LOCK = "sentinel.integrity.systemic";
 const RUNBOOK =
   "scripts/beta.sh ops sentinel integrity-breaches; ops sentinel quarantines; runbook RB-03 (sentinel mismatch)";
+const DRIFT_HINT =
+  "same rule on every merchant: likely provider format change or rails/sentinel config skew (compare nearpay_sentinel_fee_config_info with rails); compare `ops sentinel integrity-breaches` reasons with the 1Click changelog; release after the fix";
 
 const acctUuid = (id: string | null | undefined): string | null => (id && isId("acct", id) ? toUuid(id, "acct") : null);
 
-/** The pipeline breaches on genuine live addresses inside the corroboration window. */
-async function windowBreaches(db: Sentinel["db"] | Tx, sinceMs: number): Promise<Breach[]> {
-  const rows = await db
+/**
+ * The pipeline breaches on genuine live addresses inside the corroboration window (`[sinceMs, untilMs]`), as the
+ * current rules read them (an R2-only refusal recorded before SENTINEL-1 is not a breach any more).
+ */
+export async function windowBreaches(
+  db: Sentinel["db"] | Tx,
+  sinceMs: number,
+  untilMs = Number.POSITIVE_INFINITY,
+): Promise<Breach[]> {
+  let q = db
     .selectFrom("integrity_breaches")
-    .select(["id", "account_id", "destination_account_id", "created_at"])
+    .select(["id", "account_id", "destination_account_id", "created_at", "reasons"])
     .where("livemode", "=", true)
     .where("evidence", "=", "pipeline")
-    .where("created_at", ">=", new Date(sinceMs))
-    .execute();
-  return rows.map((r) => ({
-    id: r.id,
-    account: r.account_id ?? r.destination_account_id,
-    atMs: r.created_at.getTime(),
-  }));
+    .where("created_at", ">=", new Date(sinceMs));
+  if (Number.isFinite(untilMs)) q = q.where("created_at", "<=", new Date(untilMs));
+  const rows = await q.execute();
+  return rows
+    .filter((r) => stillPipelineBreach({ reasons: r.reasons, destinationMatched: r.destination_account_id !== null }))
+    .map((r) => ({
+      id: r.id,
+      account: r.account_id ?? r.destination_account_id,
+      atMs: r.created_at.getTime(),
+      reasons: r.reasons,
+    }));
 }
 
 /** Scrape-time gauge: the corroboration window right now. */
 export async function systemicWindow(s: Pick<Sentinel, "db" | "containment" | "now">) {
   const now = s.now();
   const v = systemicVerdict(await windowBreaches(s.db, now - s.containment.systemicWindowMs), s.containment, now);
-  return { refusals: v.refusals, accounts: v.accounts };
+  return { refusals: v.refusals, accounts: v.accounts, drift: v.drift.length };
 }
 
 /** Scrape-time gauge: quarantines in force. */
@@ -147,58 +176,30 @@ async function quarantine(
     await log(t, o.accountUuid, o.livemode, "quarantined", reason, "sentinel", expires, 1);
     return expires;
   }
-  const inForce = quarantineState(cur, o.nowMs) === "active";
-  const expires = quarantineExpiry(inForce ? cur.expires_at : null, o.ttlMs, o.nowMs);
+  // in force: a further breach (typically the payer retrying the same quote) never extends it (SENTINEL-2)
+  if (quarantineState(cur, o.nowMs) === "active") return cur.expires_at;
+  const expires = quarantineExpiry(null, o.ttlMs, o.nowMs);
   const version = cur.version + 1;
   await t
     .updateTable("quarantines")
-    .set(
-      inForce
-        ? { expires_at: expires, version, updated_at: now }
-        : {
-            status: "active",
-            reason,
-            breach_id: o.breachId,
-            created_by: "sentinel",
-            created_at: now,
-            expires_at: expires,
-            cleared_at: null,
-            cleared_by: null,
-            clear_note: null,
-            version,
-            updated_at: now,
-          },
-    )
+    .set({
+      status: "active",
+      reason,
+      breach_id: o.breachId,
+      created_by: "sentinel",
+      created_at: now,
+      expires_at: expires,
+      cleared_at: null,
+      cleared_by: null,
+      clear_note: null,
+      version,
+      updated_at: now,
+    })
     .where("account_id", "=", o.accountUuid)
     .where("livemode", "=", o.livemode)
     .execute();
-  await log(t, o.accountUuid, o.livemode, inForce ? "extended" : "quarantined", reason, "sentinel", expires, version);
+  await log(t, o.accountUuid, o.livemode, "quarantined", reason, "sentinel", expires, version);
   return expires;
-}
-
-async function log(
-  t: Tx,
-  accountUuid: string,
-  livemode: boolean,
-  action: "quarantined" | "extended" | "cleared",
-  reason: string,
-  actor: string,
-  expires: Date | null,
-  version: number,
-): Promise<void> {
-  await t
-    .insertInto("quarantine_log")
-    .values({
-      id: uuidv7(),
-      account_id: accountUuid,
-      livemode,
-      action,
-      reason: reason.slice(0, 500),
-      actor: actor.slice(0, 200),
-      expires_at: expires,
-      version,
-    })
-    .execute();
 }
 
 /**
@@ -218,17 +219,30 @@ export async function containBreach(s: Sentinel, i: BreachInput): Promise<Contai
 
   const result = await s.db.transaction().execute(async (t) => {
     let verdict: SystemicVerdict | null = null;
+    let drift = false;
+    let lifted: readonly string[] = [];
     if (pipeline && live) {
       // one corroboration decision at a time, so concurrent breaches cannot each miss the threshold
       await sql`select pg_advisory_xact_lock(hashtext(${SYSTEMIC_LOCK}))`.execute(t);
       const prior = await windowBreaches(t, nowMs - p.systemicWindowMs);
-      verdict = systemicVerdict(
-        [...prior, { id, account: execAccount ?? i.destinationAccount, atMs: nowMs }],
-        p,
-        nowMs,
-      );
+      const me: Breach = { id, account: execAccount ?? i.destinationAccount, atMs: nowMs, reasons: i.reasons };
+      verdict = systemicVerdict([...prior, me], p, nowMs);
+      drift = isDrift(me, new Set(verdict.drift));
+      if (drift) {
+        // the earlier refusals of the same drift quarantined their merchants before the pattern showed: lift them
+        const sig = driftSignature(i.reasons);
+        const same = prior.filter((b) => b.reasons && driftSignature(b.reasons) === sig).map((b) => b.id);
+        const r = await clearSentinelQuarantines(t, {
+          breachIds: same,
+          livemode: true,
+          actor: "sentinel",
+          note: `provider-wide drift suspected (${sig}): the same refusal on several merchants is not tampering`,
+          nowMs,
+        });
+        lifted = r.cleared.map((c) => c.account_id);
+      }
     }
-    const quarantineIt = pipeline && live && accounts.length > 0;
+    const quarantineIt = pipeline && live && accounts.length > 0 && !drift;
     await t
       .insertInto("integrity_breaches")
       .values({
@@ -246,12 +260,14 @@ export async function containBreach(s: Sentinel, i: BreachInput): Promise<Contai
         client_ip: i.ip.slice(0, 64),
         quarantined: quarantineIt,
         systemic: verdict?.engage ?? false,
+        drift,
         created_at: new Date(nowMs),
       })
       .execute();
 
-    // the audit finding (compliance case, ops page) — pipeline evidence on an execution rails named
-    if (pipeline && i.lookup.execution_id && execAccount) {
+    // the audit finding (compliance case, ops page) — pipeline evidence on an execution rails named; provider-wide
+    // drift pages once (below) instead of opening a case per merchant
+    if (pipeline && !drift && i.lookup.execution_id && execAccount) {
       const details = {
         breach_id: id,
         evidence: i.evidence,
@@ -321,7 +337,7 @@ export async function containBreach(s: Sentinel, i: BreachInput): Promise<Contai
       );
       engaged = !before.engaged;
     }
-    return { quarantined: quarantineIt ? accounts : [], until, verdict, engaged };
+    return { quarantined: quarantineIt ? accounts : [], until, verdict, engaged, drift, lifted };
   });
 
   const ctx = {
@@ -340,22 +356,45 @@ export async function containBreach(s: Sentinel, i: BreachInput): Promise<Contai
       ctx,
       "attestation request differs from the provider's quote on a NearPay deposit address (caller-supplied fields: refused and recorded, nothing stopped)",
     );
+  } else if (result.drift) {
+    s.metrics.integrityDrift("pattern", rules.join("+"));
+    if (result.lifted.length) s.metrics.quarantinesCleared("drift", result.lifted.length);
+    s.log.error(
+      {
+        ...ctx,
+        alert: "integrity_drift_suspected",
+        signature: driftSignature(i.reasons),
+        drift: result.verdict?.drift ?? [],
+        lifted: result.lifted.map((a) => fromUuid("acct", a)),
+        hint: DRIFT_HINT,
+      },
+      "ALERT integrity_drift_suspected: every merchant's payments are refused for the same reason, which looks like a provider format change, not tampering. Payments for them are refused until it is fixed; nobody is quarantined and the kill switch is not engaged",
+    );
   } else {
     s.log.error(
       {
         ...ctx,
+        alert: "integrity_breach",
         quarantined: result.quarantined.map((a) => fromUuid("acct", a)),
         until: result.until?.toISOString() ?? null,
         window: result.verdict,
         runbook: RUNBOOK,
       },
-      "ALERT quote integrity breach on a NearPay deposit address",
+      "ALERT quote integrity breach on a NearPay deposit address: the payment was refused and the merchant is paused for a while",
     );
     if (result.engaged) {
       s.metrics.systemicEngaged();
+      const uniform = result.verdict?.uniformRules ?? null;
+      if (uniform) {
+        s.metrics.integrityDrift("engaged", uniform);
+        s.log.error(
+          { alert: "integrity_drift_suspected", rules: uniform, window: result.verdict, hint: DRIFT_HINT },
+          "ALERT integrity_drift_suspected: the payments that paused the platform all failed the same check on several merchants; this may be a provider change or a configuration mismatch between rails and sentinel",
+        );
+      }
       s.log.error(
-        { ...result.verdict, runbook: RUNBOOK },
-        "ALERT systemic integrity breach: sentinel engaged the kill switch (corroborated across accounts); it stays engaged until ops release it",
+        { alert: "systemic_integrity_breach", ...result.verdict, runbook: RUNBOOK },
+        "ALERT Payments are paused: the same kind of problem was found on several merchants' payments within minutes. They stay paused until an operator releases the kill switch in the console",
       );
     }
   }
@@ -492,6 +531,31 @@ export async function changeQuarantine(
   );
   const all = await listQuarantines(s, true);
   return all.find((q) => q.account_id === o.account && q.livemode === o.livemode) as QuarantineView;
+}
+
+/**
+ * Ops `quarantine-clear-all <reason>` (SENTINEL-2): clears every quarantine in force in a mode that sentinel
+ * created and no operator changed since; operator holds are kept and listed. Audit-logged per account.
+ */
+export async function clearAllQuarantines(
+  s: Pick<Sentinel, "db" | "log" | "metrics" | "now">,
+  o: { livemode: boolean; note: string; actor: string },
+) {
+  const r = await s.db
+    .transaction()
+    .execute((t) =>
+      clearSentinelQuarantines(t, { livemode: o.livemode, actor: o.actor, note: o.note, nowMs: s.now() }),
+    );
+  if (r.cleared.length) s.metrics.quarantinesCleared("ops_all", r.cleared.length);
+  s.log.warn(
+    { livemode: o.livemode, cleared: r.cleared.length, kept: r.kept.length, actor: o.actor },
+    "Merchants paused by sentinel were switched back on by an operator",
+  );
+  return {
+    livemode: o.livemode,
+    cleared: r.cleared.map((c) => fromUuid("acct", c.account_id)),
+    kept: r.kept.map((k) => ({ account_id: fromUuid("acct", k.account_id), by: k.by })),
+  };
 }
 
 /** Recorded integrity breaches, newest first. */

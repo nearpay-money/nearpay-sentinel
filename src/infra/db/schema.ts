@@ -106,7 +106,17 @@ export interface IntegrityBreachesTable {
   client_ip: Opt<string>;
   quarantined: ColumnType<boolean, boolean | undefined, boolean>;
   systemic: ColumnType<boolean, boolean | undefined, boolean>;
+  /** Classified provider-wide drift when recorded (migration 0006, SENTINEL-1). */
+  drift: ColumnType<boolean, boolean | undefined, boolean>;
   created_at: Timestamp;
+}
+
+/** The last good provider token list per registry (migration 0006, SENTINEL-4). */
+export interface TokenListsTable {
+  registry: "live" | "test";
+  body: ColumnType<unknown, string, string>;
+  fetched_at: ColumnType<Date, Date, Date>;
+  updated_at: Timestamp;
 }
 
 /** One quarantine per (account, mode) (migration 0005). */
@@ -148,6 +158,7 @@ export interface SentinelTables {
   kill_switch: KillSwitchTable;
   kill_switch_log: KillSwitchLogTable;
   release_requests: ReleaseRequestsTable;
+  token_lists: TokenListsTable;
 }
 
 export type DB = SentinelTables & KitTables;

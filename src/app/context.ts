@@ -31,12 +31,46 @@ export interface SentinelMetrics {
   integrityRefusal(livemode: boolean, evidence: string, rule: string, address: string): void;
   /** The corroboration rule engaged the global kill switch. */
   systemicEngaged(): void;
+  /**
+   * Provider-wide drift suspected (SENTINEL-1, `integrity_drift_total{source,rules}`): `r2_only` an R2-only
+   * refusal (unavailable), `pattern` a drift-classified breach (not contained), `engaged` the systemic rule
+   * engaged on refusals that all share one rule set.
+   */
+  integrityDrift(source: "r2_only" | "pattern" | "engaged", rules: string): void;
+  /** Quarantines lifted in bulk (`quarantines_cleared_total{by}`): `release`, `drift`, `ops_all`. */
+  quarantinesCleared(by: "release" | "drift" | "ops_all", n: number): void;
 }
+
+/** Attestation outcomes pre-created at zero so `increase()` sees the first failure (SENTINEL-3). */
+export const ATTESTATION_OUTCOMES: readonly (readonly [result: string, reason: string])[] = [
+  ["signed", "ok"],
+  ["signed", "cached"],
+  ["unavailable", "R1"],
+  ["unavailable", "provider"],
+  ["unavailable", "registry"],
+  ["unavailable", "checks"],
+  ["unavailable", "integrity_drift"],
+  ["unavailable", "quarantined"],
+  ["unavailable", "asset"],
+  ["rejected", "security"],
+  ["rejected", "stale"],
+  ["rejected", "ambiguous"],
+  ["rejected", "ticket"],
+  ["rejected", "rate_limited"],
+];
 
 /** Scrape-time readers for the containment gauges (database state shared by every replica). */
 export interface ContainmentGauges {
   quarantinesActive(): Promise<number>;
-  systemicWindow(): Promise<{ refusals: number; accounts: number }>;
+  systemicWindow(): Promise<{ refusals: number; accounts: number; drift?: number }>;
+}
+
+/** Static facts exported as gauges at boot (SENTINEL-1 config hash, SENTINEL-3 1Click key expiry). */
+export interface StaticGauges {
+  /** `fee_config_info{hash}` = 1 (address-integrity/config-hash.ts). */
+  readonly feeConfigHash?: string;
+  /** `oneclick_key_expiry_seconds{mode}`: the `exp` (unix seconds) of sentinel's 1Click key when it is a JWT. */
+  readonly oneClickKeyExpiry?: Readonly<Record<string, number | null>>;
 }
 
 export const noMetrics: SentinelMetrics = {
@@ -47,6 +81,8 @@ export const noMetrics: SentinelMetrics = {
   singleOperatorAction() {},
   integrityRefusal() {},
   systemicEngaged() {},
+  integrityDrift() {},
+  quarantinesCleared() {},
 };
 
 /** Service metrics (§12). The kill-switch gauge is read from the database on every scrape. */
@@ -55,8 +91,11 @@ export function sentinelMetrics(
   engaged?: () => Promise<boolean>,
   singleOperatorAction: (action: string) => void = () => {},
   containment?: ContainmentGauges,
+  statics: StaticGauges = {},
 ): SentinelMetrics {
   const att = m.counter("attestations_total", "Co-signing requests by outcome.", ["kind", "result", "reason"]);
+  for (const kind of ["route_quote", "intents_transfer"])
+    for (const [result, reason] of ATTESTATION_OUTCOMES) att.inc({ kind, result, reason }, 0);
   const dur = m.histogram(
     "attestation_duration_seconds",
     "Co-signing latency.",
@@ -107,10 +146,43 @@ export function sentinelMetrics(
           const w = await containment.systemicWindow();
           g.set({ measure: "refusals" }, w.refusals);
           g.set({ measure: "accounts" }, w.accounts);
+          g.set({ measure: "drift" }, w.drift ?? 0);
         }
       : undefined,
   );
+  const drift = m.counter(
+    "integrity_drift_total",
+    "Provider-wide drift suspected (SENTINEL-1): R2-only refusals, drift-classified breaches, uniform systemic engagements.",
+    ["source", "rules"],
+  );
+  for (const [source, rules] of [
+    ["r2_only", "R2"],
+    ["pattern", "R4"],
+    ["pattern", "R6"],
+    ["pattern", "R4+R6"],
+  ] as const)
+    drift.inc({ source, rules }, 0);
+  const cleared = m.counter(
+    "quarantines_cleared_total",
+    "Quarantines lifted in bulk: on a kill-switch release, on drift classification, by ops quarantine-clear-all.",
+    ["by"],
+  );
+  const feeConfig = m.gauge(
+    "fee_config_info",
+    "1 for the fingerprint of sentinel's treasury/referral/provider-split configuration (rails exposes the same; alert on more than one).",
+    ["hash"],
+  );
+  if (statics.feeConfigHash) feeConfig.set({ hash: statics.feeConfigHash }, 1);
+  const keyExpiry = m.gauge(
+    "oneclick_key_expiry_seconds",
+    "Expiry (unix seconds, the JWT exp) of sentinel's 1Click API key per mode; absent when the key is not a JWT.",
+    ["mode"],
+  );
+  for (const [mode, exp] of Object.entries(statics.oneClickKeyExpiry ?? {}))
+    if (exp !== null) keyExpiry.set({ mode }, exp);
   return {
+    integrityDrift: (source, rules) => drift.inc({ source, rules }),
+    quarantinesCleared: (by, n) => cleared.inc({ by }, n),
     integrityRefusal: (livemode, evidence, rule, address) =>
       refusals.inc({ livemode: String(livemode), evidence, rule, address }),
     systemicEngaged: () => systemic.inc(),

@@ -6,6 +6,11 @@
  * 10 minutes; when a refresh fails, a list younger than 6 hours is still used (an asset id's decimals do
  * not change); an asset missing from the list triggers at most one refresh per 30 s. No list at all is
  * {@link TokensUnavailable}: the co-signer refuses (fail closed).
+ *
+ * SENTINEL-4: once a list exists a stale one is served at once and refreshed in the background (an
+ * attestation never waits 2 × 5 s on a 1Click outage); a failed refresh is not retried for 30 s (negative
+ * cache), also when there is no list; the last good list is persisted ({@link TokenListStore}, sentinel's own
+ * database) and loaded on first use after a restart, within the same 6-hour age limit.
  */
 import { httpClient } from "@nearpay-internal/http";
 import { OneClickToken, sandboxTokens } from "@nearpay-internal/spec";
@@ -25,6 +30,14 @@ export interface TokenRegistry {
 export const TOKENS_FRESH_MS = 10 * 60_000;
 export const TOKENS_MAX_AGE_MS = 6 * 60 * 60_000;
 export const TOKENS_MISS_REFRESH_MS = 30_000;
+/** After a failed refresh, no new attempt for this long (negative cache). */
+export const TOKENS_RETRY_MS = 30_000;
+
+/** The last good token list, persisted (a DB row per registry). */
+export interface TokenListStore {
+  load(): Promise<{ body: unknown; atMs: number } | null>;
+  save(body: unknown, atMs: number): Promise<void>;
+}
 
 const Entry = OneClickToken.pick({ assetId: true, symbol: true, decimals: true }).extend({
   blockchain: z.string().nullish(),
@@ -60,29 +73,63 @@ export function tokenMap(body: unknown): Map<string, AssetDisplay> {
   return map;
 }
 
-/** Caching registry over a list fetcher. */
-export function cachedTokenRegistry(fetchList: () => Promise<unknown>, now: () => number = Date.now): TokenRegistry {
+/** Caching registry over a list fetcher (module doc). */
+export function cachedTokenRegistry(
+  fetchList: () => Promise<unknown>,
+  now: () => number = Date.now,
+  store?: TokenListStore,
+): TokenRegistry {
   let list: { map: Map<string, AssetDisplay>; at: number } | null = null;
   let lastMissRefresh = Number.NEGATIVE_INFINITY;
+  let retryAt = Number.NEGATIVE_INFINITY;
   let inflight: Promise<void> | null = null;
+  let loaded: Promise<void> | null = null;
   const refresh = () => {
     inflight ??= (async () => {
       try {
-        list = { map: tokenMap(await fetchList()), at: now() };
+        const body = await fetchList();
+        const map = tokenMap(body);
+        list = { map, at: now() };
+        retryAt = Number.NEGATIVE_INFINITY;
+        await store?.save(body, list.at).catch(() => {});
+      } catch (e) {
+        retryAt = now() + TOKENS_RETRY_MS;
+        throw e;
       } finally {
         inflight = null;
       }
     })();
     return inflight;
   };
-  async function current(force: boolean): Promise<Map<string, AssetDisplay>> {
-    if (!list || force || now() - list.at >= TOKENS_FRESH_MS) {
+  // the persisted last good list, once per process (before the first fetch)
+  const load = () => {
+    loaded ??= (async () => {
       try {
-        await refresh();
-      } catch (e) {
-        if (!list || now() - list.at >= TOKENS_MAX_AGE_MS)
-          throw new TokensUnavailable(`token registry unreachable: ${e instanceof Error ? e.message : String(e)}`);
+        const p = await store?.load();
+        if (p && !list && now() - p.atMs < TOKENS_MAX_AGE_MS) list = { map: tokenMap(p.body), at: p.atMs };
+      } catch {}
+    })();
+    return loaded;
+  };
+  async function current(force: boolean): Promise<Map<string, AssetDisplay>> {
+    if (store) await load();
+    const have = list as { map: Map<string, AssetDisplay>; at: number } | null;
+    const usable = have !== null && now() - have.at < TOKENS_MAX_AGE_MS;
+    if (have && usable && !force && now() - have.at < TOKENS_FRESH_MS) return have.map;
+    const mayTry = now() >= retryAt;
+    if (have && usable) {
+      if (mayTry) {
+        // a miss waits for the refresh (the asset may be new); staleness alone refreshes in the background
+        if (force) await refresh().catch(() => {});
+        else refresh().catch(() => {});
       }
+      return (list as unknown as { map: Map<string, AssetDisplay> }).map;
+    }
+    if (!mayTry) throw new TokensUnavailable("token registry unreachable (next attempt within 30 s)");
+    try {
+      await refresh();
+    } catch (e) {
+      throw new TokensUnavailable(`token registry unreachable: ${e instanceof Error ? e.message : String(e)}`);
     }
     return (list as unknown as { map: Map<string, AssetDisplay> }).map;
   }
@@ -101,6 +148,8 @@ export function oneClickTokens(o: {
   baseUrl: string;
   apiKey?: string | undefined;
   fetch?: typeof fetch;
+  store?: TokenListStore;
+  now?: () => number;
 }): TokenRegistry {
   const client = httpClient({
     target: "oneclick",
@@ -113,6 +162,8 @@ export function oneClickTokens(o: {
   return cachedTokenRegistry(
     async () =>
       (await client.request({ method: "GET", path: "/v0/tokens", headers: oneClickAuthHeaders(o.apiKey) })).body,
+    o.now,
+    o.store,
   );
 }
 
@@ -120,6 +171,7 @@ export function sandboxTokenRegistry(o: {
   baseUrl: string;
   serviceToken: () => Promise<string>;
   fetch?: typeof fetch;
+  store?: TokenListStore;
 }): TokenRegistry {
   const client = httpClient({
     target: "sandbox",
@@ -130,7 +182,9 @@ export function sandboxTokenRegistry(o: {
     serviceToken: o.serviceToken,
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
-  return cachedTokenRegistry(async () =>
-    client.request({ method: "GET", path: sandboxTokens.path }).then((r) => r.body),
+  return cachedTokenRegistry(
+    async () => client.request({ method: "GET", path: sandboxTokens.path }).then((r) => r.body),
+    Date.now,
+    o.store,
   );
 }

@@ -67,7 +67,8 @@ function quote(
 ): { q: OneClickQuoteResponse; m: M } {
   const q = oc.quote({
     request: { appFees: fees, recipient: o.recipient ?? recipient(m) },
-    ...(o.tamper ? { afterSign: (x: OneClickQuoteResponse) => (x.quote.amountOut = "1") } : {}),
+    // changed after signing: R2 and R3 both fail (an R2-only failure is provider drift, never a breach)
+    ...(o.tamper ? { afterSign: (x: OneClickQuoteResponse) => (x.quoteRequest.referral = "attacker") } : {}),
   });
   if (o.issued !== false) s.issued.set(q.quote.depositAddress as string, { livemode: true, account_id: acct[m] });
   return { q, m };
@@ -119,7 +120,7 @@ describe("a single breach never stops the platform", () => {
     const [breach] = await breaches();
     expect(breach).toMatchObject({
       evidence: "pipeline",
-      rules: ["R2"],
+      rules: ["R2", "R3"],
       account_id: toUuid(acct.a, "acct"),
       destination_account_id: toUuid(acct.a, "acct"),
       quarantined: true,
@@ -188,7 +189,7 @@ describe("a single breach never stops the platform", () => {
   it("many breaches on one account stay local", async () => {
     for (let i = 0; i < 5; i++) expect((await attest(body(quote("a", { tamper: true }).q))).status).toBe(409);
     expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
-    expect(await systemicWindow(s.sentinel)).toEqual({ refusals: 5, accounts: 1 });
+    expect(await systemicWindow(s.sentinel)).toEqual({ refusals: 5, accounts: 1, drift: 0 });
     expect((await attest(body(quote("b").q))).status).toBe(200);
   });
 });
@@ -337,5 +338,231 @@ describe("configuration errors are unavailable, not security", () => {
     } finally {
       await api.stop();
     }
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// 2026-11-12 resilience audit (SENTINEL-1, -2, -6)
+// ------------------------------------------------------------------------------------------------
+
+const quarantineRow = (m: M) =>
+  s.admin.db
+    .selectFrom("quarantines")
+    .selectAll()
+    .where("account_id", "=", toUuid(acct[m], "acct"))
+    .where("livemode", "=", true)
+    .executeTakeFirst();
+
+describe("SENTINEL-1: provider-wide drift is not tampering", () => {
+  it("R2 alone with every other check passing → 503 unavailable, recorded, no breach, no quarantine, no switch", async () => {
+    for (const m of MERCHANTS) {
+      const q = oc.quote({
+        request: { appFees: fees, recipient: recipient(m) },
+        afterSign: (x) => (x.quote.amountOut = "1"), // a signed field the checks do not compare
+      });
+      s.issued.set(q.quote.depositAddress as string, { livemode: true, account_id: acct[m] });
+      const b = body(q);
+      const r = await attest(b);
+      expect(r.status).toBe(503);
+      expect(r.body).toMatchObject({ error: { code: "attestation_unavailable" } });
+      expect(await lastRecord(b.attempt_id)).toMatchObject({
+        result: "unavailable",
+        class: "unavailable",
+        reasons: [expect.stringMatching(/^R2 .*provider echo drift suspected/)],
+      });
+    }
+    expect(await breaches()).toEqual([]);
+    expect(await quarantinesActive(s.sentinel)).toBe(0);
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
+    // every merchant still signs a genuine quote
+    for (const m of MERCHANTS) expect((await attest(body(quote(m).q))).status).toBe(200);
+  });
+
+  it("the same R6 format change on every merchant: refused, recorded as drift, quarantines lifted, switch never engages", async () => {
+    // 1Click starts adding a third fee entry (format change): treasury still paid once, total within 500 bps
+    const drifted = [
+      { recipient: LIVE_TREASURY, fee: 25 },
+      { recipient: PROVIDER_FEE_ACCOUNT, fee: 20 },
+      { recipient: "partner.near", fee: 5 },
+    ];
+    const driftQuote = (m: M) => {
+      const q = oc.quote({ request: { appFees: drifted, recipient: recipient(m) } });
+      s.issued.set(q.quote.depositAddress as string, { livemode: true, account_id: acct[m] });
+      return body(q);
+    };
+    // first merchant: nothing to compare with yet, so it is contained like any breach
+    expect((await attest(driftQuote("a"))).status).toBe(409);
+    expect(await quarantineRow("a")).toMatchObject({ status: "active" });
+    // second merchant, same refusal: drift — a's quarantine is lifted, b is not quarantined
+    expect((await attest(driftQuote("b"))).status).toBe(409);
+    expect(await quarantinesActive(s.sentinel)).toBe(0);
+    expect(await quarantineRow("a")).toMatchObject({ status: "cleared", cleared_by: "sentinel" });
+    expect(await quarantineRow("b")).toBeUndefined();
+    // more refusals on every merchant, well past the systemic threshold: still no switch
+    for (const m of ["c", "a", "b", "c"] as const) expect((await attest(driftQuote(m))).status).toBe(409);
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
+    expect(await quarantinesActive(s.sentinel)).toBe(0);
+    const all = await breaches();
+    expect(all.map((b) => [b.drift, b.quarantined, b.systemic])).toEqual([
+      [false, true, false],
+      [true, false, false],
+      [true, false, false],
+      [true, false, false],
+      [true, false, false],
+      [true, false, false],
+    ]);
+    expect(await systemicWindow(s.sentinel)).toEqual({ refusals: 0, accounts: 0, drift: 1 });
+    // only the first (pre-pattern) refusal opened a per-merchant audit finding
+    const findings = await s.admin.db
+      .selectFrom("audit_findings")
+      .select("id")
+      .where("check_kind", "=", "attestation")
+      .execute();
+    expect(findings).toHaveLength(1);
+    // the merchants keep signing genuine quotes
+    for (const m of MERCHANTS) expect((await attest(body(quote(m).q))).status).toBe(200);
+  });
+
+  it("a breach that can redirect funds keeps its weight next to drift (R5 on two merchants still engages)", async () => {
+    const drifted = [
+      { recipient: LIVE_TREASURY, fee: 25 },
+      { recipient: PROVIDER_FEE_ACCOUNT, fee: 20 },
+      { recipient: "partner.near", fee: 5 },
+    ];
+    for (const m of ["a", "b"] as const) {
+      const q = oc.quote({ request: { appFees: drifted, recipient: recipient(m) } });
+      s.issued.set(q.quote.depositAddress as string, { livemode: true, account_id: acct[m] });
+      expect((await attest(body(q))).status).toBe(409);
+    }
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
+    for (const m of ["a", "b", "a"] as const) {
+      const q = oc.quote({ request: { appFees: fees, recipient: "attacker.near" } });
+      s.issued.set(q.quote.depositAddress as string, { livemode: true, account_id: acct[m] });
+      expect((await attest(body(q))).status).toBe(409);
+    }
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(true);
+    expect(await systemicWindow(s.sentinel)).toEqual({ refusals: 3, accounts: 2, drift: 1 });
+  });
+});
+
+describe("SENTINEL-2: quarantines after a release, and retries", () => {
+  it("retries of a quarantined account do not extend the quarantine", async () => {
+    expect((await attest(body(quote("a", { tamper: true }).q))).status).toBe(409);
+    const first = await quarantineRow("a");
+    for (let i = 0; i < 3; i++) expect((await attest(body(quote("a", { tamper: true }).q))).status).toBe(409);
+    const after = await quarantineRow("a");
+    expect(after?.expires_at.getTime()).toBe(first?.expires_at.getTime());
+    expect(after?.version).toBe(first?.version);
+    const log = await s.admin.db.selectFrom("quarantine_log").select("action").execute();
+    expect(log).toEqual([{ action: "quarantined" }]);
+  });
+
+  it("systemic engage → release → sentinel's quarantines cleared (operator holds kept) → those merchants sign again", async () => {
+    // an operator hold on c, created before the stop
+    expect((await ops("quarantine-extend", acct.c, "60", "manual review")).code).toBe(0);
+    for (const m of ["a", "b", "a"] as const)
+      expect((await attest(body(quote(m, { tamper: true }).q))).status).toBe(409);
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(true);
+    expect(await quarantinesActive(s.sentinel)).toBe(3);
+    // the operator also extends b's sentinel quarantine during the stop: theirs now, kept
+    expect((await ops("quarantine-extend", acct.b, "120", "looking at b")).code).toBe(0);
+
+    const status = await ops("kill-switch-release-status");
+    expect(status.json).toMatchObject({
+      engaged: true,
+      would_engage_under_current_rules: true,
+      merchants_switched_back_on_by_release: 1, // a; b was changed by an operator, c is an operator's hold
+      merchants_kept_paused_by_operators: 2, // b (changed by an operator) and c (an operator hold)
+      pending_release: null,
+    });
+    expect(status.json.summary).toMatch(/^Payments are paused: an automatic check found/);
+
+    const released = await ops("kill-switch-release", "fixed: rotated the provider key");
+    expect(released.code).toBe(0);
+    expect(released.json).toMatchObject({ engaged: false, quarantines_cleared: 1 });
+    expect(await quarantineRow("a")).toMatchObject({ status: "cleared", cleared_by: "cli@test" });
+    expect(await quarantineRow("b")).toMatchObject({ status: "active" });
+    expect(await quarantineRow("c")).toMatchObject({ status: "active", created_by: "cli@test" });
+    const log = await s.admin.db
+      .selectFrom("quarantine_log")
+      .select(["action", "actor", "reason"])
+      .where("account_id", "=", toUuid(acct.a, "acct"))
+      .orderBy("version")
+      .execute();
+    expect(log.at(-1)).toMatchObject({
+      action: "cleared",
+      actor: "cli@test",
+      reason: "kill switch released: fixed: rotated the provider key",
+    });
+    // the next attestation for a signs
+    expect((await attest(body(quote("a").q))).status).toBe(200);
+  });
+
+  it("ops quarantine-clear-all lifts sentinel's holds in a mode, keeps operator holds, and audit-logs each", async () => {
+    expect((await attest(body(quote("a", { tamper: true }).q))).status).toBe(409);
+    expect((await attest(body(quote("b", { tamper: true }).q))).status).toBe(409);
+    expect((await ops("quarantine-extend", acct.c, "30", "hold c")).code).toBe(0);
+    expect((await ops("quarantine-clear-all")).code).toBe(2);
+    const r = await ops("quarantine-clear-all", "provider", "format", "fixed");
+    expect(r.code).toBe(0);
+    expect(r.json).toEqual({
+      livemode: true,
+      cleared: expect.arrayContaining([acct.a, acct.b]),
+      kept: [{ account_id: acct.c, by: "cli@test" }],
+    });
+    expect(r.json.cleared).toHaveLength(2);
+    expect(await quarantinesActive(s.sentinel)).toBe(1);
+    const cleared = await s.admin.db
+      .selectFrom("quarantine_log")
+      .select(["actor", "reason"])
+      .where("action", "=", "cleared")
+      .execute();
+    expect(cleared).toEqual([
+      { actor: "cli@test", reason: "provider format fixed" },
+      { actor: "cli@test", reason: "provider format fixed" },
+    ]);
+    // test mode has nothing to clear
+    expect((await ops("quarantine-clear-all", "x", "--test")).json).toEqual({ livemode: false, cleared: [], kept: [] });
+  });
+
+  it("kill-switch-release-status: a stale single-breach stop (the 2026-11-11 incident) is reported as not platform evidence", async () => {
+    await sql`update kill_switch set engaged = true, actor = 'sentinel',
+      reason = 'integrity breach on 0x11D2…5036: R4 deposit chain differs', updated_at = now() where id = 1`.execute(
+      s.admin.db,
+    );
+    const r = await ops("kill-switch-release-status");
+    expect(r.json).toMatchObject({
+      engaged: true,
+      would_engage_under_current_rules: false,
+      summary: "Payments are paused: an automatic check refused a payment.",
+    });
+    expect(r.json.assessment).toMatch(/would not happen under the current rules/);
+    expect(r.json.steps[0]).toMatch(/Request release/);
+    // it informs only: nothing was released
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(true);
+    await sql`update kill_switch set engaged = false where id = 1`.execute(s.admin.db);
+    expect((await ops("kill-switch-release-status")).json).toMatchObject({ engaged: false });
+  });
+});
+
+describe("SENTINEL-6: request-evidence refusals are limited per attempt, not per IP", () => {
+  it("6 request-evidence refusals from one IP for different attempts: the 7th, valid, request is not 429", async () => {
+    const ip = "100.64.0.9"; // carrier-grade NAT: many payers, one address
+    for (let i = 0; i < 6; i++) {
+      const { q } = quote(MERCHANTS[i % 3] as M);
+      expect((await attest(body(q, { amount_in: "1" }), ip)).status).toBe(409);
+    }
+    expect((await attest(body(quote("b").q), ip)).status).toBe(200);
+  });
+
+  it("the same attempt repeating a request-evidence refusal is limited after 5", async () => {
+    const ip = "100.64.0.10";
+    const { q } = quote("c");
+    const b = body(q, { amount_in: "1" });
+    for (let i = 0; i < 5; i++) expect((await attest(b, ip)).status).toBe(409);
+    const limited = await attest({ ...b, deposit: { ...b.deposit, amount_in: q.quote.amountIn } }, ip);
+    expect(limited.status).toBe(429);
+    // another attempt from the same IP is fine
+    expect((await attest(body(quote("c").q), ip)).status).toBe(200);
   });
 });

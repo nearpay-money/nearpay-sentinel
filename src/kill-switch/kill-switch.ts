@@ -5,11 +5,17 @@
  * (./release.ts) is the only release on the server stage; the single-person release of the ops CLI and
  * `POST /internal/kill-switch` answers `409 two_person_required` there and stays on local/test stacks.
  * Every change also expires a pending release request (it was for the previous version).
+ *
+ * Releasing (by any path) also clears, in the same transaction, the quarantines sentinel created during the
+ * engagement (SENTINEL-2): the cause has been dealt with, so the merchants it paused resume with everyone
+ * else. Holds an operator created or changed are kept (./quarantine-clear.ts).
  */
 import { emit } from "@nearpay-internal/db";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
+import { DEFAULT_CONTAINMENT, engagementQuarantineSince } from "../address-integrity/containment.js";
 import type { Sentinel, Tx } from "../app/context.js";
+import { clearSentinelQuarantines } from "./quarantine-clear.js";
 import { singlePersonAllowed } from "./two-person.js";
 
 /** The kill switch aggregate (a singleton). */
@@ -22,6 +28,18 @@ export interface KillSwitchState {
   version: number;
   updated_at: Date;
 }
+
+/** The reason in plain words for the alert's first line (the recorded reason keeps every detail). */
+export function plainReason(reason: string, actor: string): string {
+  if (actor === "sentinel" && reason.startsWith("systemic integrity breach"))
+    return "an automatic check found the same kind of problem on several merchants' payments within minutes";
+  if (actor === "sentinel") return "an automatic check refused a payment";
+  return reason;
+}
+
+/** Plain-language hint for whoever reads the paused-payments alert. */
+export const RESUME_HINT =
+  "To resume: release the kill switch in the console (scripts/beta.sh ops sentinel kill-switch-release-status shows where the release stands)";
 
 export async function killSwitchState(s: Pick<Sentinel, "db">): Promise<KillSwitchState> {
   return s.db.selectFrom("kill_switch").selectAll().where("id", "=", 1).executeTakeFirstOrThrow();
@@ -44,12 +62,13 @@ export function killSwitchView(st: KillSwitchState) {
 
 /** Engages or releases. No-op (returns the state) when already in the requested position. */
 export async function setKillSwitch(
-  s: Pick<Sentinel, "db" | "log" | "metrics">,
+  s: Pick<Sentinel, "db" | "log" | "metrics"> & Partial<Pick<Sentinel, "containment" | "now">>,
   engaged: boolean,
   reason: string,
   actor: string,
   tx?: Tx,
-): Promise<KillSwitchState> {
+): Promise<KillSwitchState & { quarantines_cleared?: number }> {
+  let cleared = 0;
   const run = async (t: Tx) => {
     const cur = await t.selectFrom("kill_switch").selectAll().where("id", "=", 1).forUpdate().executeTakeFirstOrThrow();
     if (cur.engaged === engaged) return cur;
@@ -72,13 +91,38 @@ export async function setKillSwitch(
       livemode: null,
       data: { object: { engaged, reason: next.reason, actor: next.actor }, previous: { engaged: cur.engaged } },
     });
+    if (!engaged) {
+      const since = engagementQuarantineSince(
+        { actor: cur.actor, atMs: cur.updated_at.getTime() },
+        s.containment ?? DEFAULT_CONTAINMENT,
+      );
+      const r = await clearSentinelQuarantines(t, {
+        since: new Date(since),
+        actor,
+        note: `kill switch released: ${next.reason}`,
+        nowMs: s.now ? s.now() : Date.now(),
+      });
+      cleared = r.cleared.length;
+    }
     return next;
   };
   const state = tx ? await run(tx) : await s.db.transaction().execute(run);
   s.metrics.killSwitch(state.engaged);
-  if (engaged) s.log.error({ reason, actor }, "ALERT kill switch engaged: live quoting stopped");
-  else s.log.warn({ reason, actor }, "kill switch released");
-  return state;
+  if (engaged)
+    s.log.error(
+      { alert: "kill_switch_engaged", reason, actor },
+      `ALERT Payments are paused: ${plainReason(reason, actor)}. ${RESUME_HINT}`,
+    );
+  else {
+    if (cleared) s.metrics.quarantinesCleared("release", cleared);
+    s.log.warn(
+      { alert: "kill_switch_released", reason, actor, quarantines_cleared: cleared },
+      cleared
+        ? `Payments are back on; ${cleared} merchant(s) paused during the stop were switched back on too`
+        : "Payments are back on",
+    );
+  }
+  return cleared ? { ...state, quarantines_cleared: cleared } : state;
 }
 
 /** Marks every pending release request `expired` (inside the caller's transaction). */

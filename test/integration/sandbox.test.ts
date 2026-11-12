@@ -204,11 +204,11 @@ describe("test mode against the sandbox", () => {
     expect(await results(x.id)).toEqual({ destination: "pass", settlement: "pass" });
   });
 
-  it("refuses a sandbox quote signed with a waiting time other than rails' (R2)", async () => {
+  it("refuses a sandbox quote signed with a waiting time other than rails' (R2 alone: unavailable drift, SENTINEL-1)", async () => {
     const q = await sandboxQuote({ quoteWaitingTimeMs: 1000 });
     const res = await s.call("POST", PATH, { body: body(q) });
-    expect(res.status).toBe(409);
-    expect(res.body).toMatchObject({ error: { code: "attestation_refused" } });
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ error: { code: "attestation_unavailable" } });
   });
 
   it("refuses a sandbox quote whose fee does not pay the test treasury", async () => {

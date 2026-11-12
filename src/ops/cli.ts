@@ -10,8 +10,15 @@ import { sql } from "@nearpay-internal/db";
 import { fromUuid, isId, toUuid } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import type { Sentinel } from "../app/context.js";
-import { changeQuarantine, listBreaches, listQuarantines, QuarantineNotFound } from "../kill-switch/containment.js";
+import {
+  changeQuarantine,
+  clearAllQuarantines,
+  listBreaches,
+  listQuarantines,
+  QuarantineNotFound,
+} from "../kill-switch/containment.js";
 import { killSwitchState, setKillSwitch, setKillSwitchSinglePerson } from "../kill-switch/kill-switch.js";
+import { releaseStatus } from "./release-status.js";
 
 async function quarantineChange(s: Sentinel, o: Parameters<typeof changeQuarantine>[1]) {
   try {
@@ -28,6 +35,9 @@ export const USAGE = `usage: ops.js <command> [arguments]
   kill-switch                               the kill switch and its last 20 changes
   kill-switch-engage <reason…>              stop live quoting now
   kill-switch-release <reason…>             resume live quoting (one operator; local/test stacks only)
+  kill-switch-release-status                where a release stands: why payments are paused, whether that stop would
+                                            happen under the current rules, the pending request and when it can be
+                                            completed, and how many paused merchants the release switches back on
   findings [--all] [--limit N]              open (unacknowledged, non-pass) audit findings; --all: every finding
   finding-ack <fnd_…> <note…>               acknowledge a finding
   attestations <pa_… | deposit key | deposit address> [--limit N]   co-signing records, newest first
@@ -35,9 +45,12 @@ export const USAGE = `usage: ops.js <command> [arguments]
   quarantines [--all]                       accounts sentinel does not sign for right now; --all: every quarantine
   quarantine-clear <acct_…> <note…> [--test]          sign for the account again now
   quarantine-extend <acct_…> <minutes> <note…> [--test]  hold (or re-hold) the account for <minutes> from now
+  quarantine-clear-all <reason…> [--test]   sign again for every account sentinel paused (holds an operator set or
+                                            changed are kept and listed)
 
   A breach on one payment quarantines that account only (ADR-0028); quarantines expire on their own
-  (NP_QUARANTINE_TTL_S). The kill switch is engaged by sentinel only on corroborated breaches across accounts
+  (NP_QUARANTINE_TTL_S); retries never extend one. Releasing the kill switch also lifts the quarantines sentinel
+  set during the stop. The kill switch is engaged by sentinel only on corroborated breaches across accounts
   and is released in the console (two-person / single-operator release).`;
 
 class UsageError extends Error {}
@@ -142,6 +155,8 @@ async function run(
       return setKillSwitch(s, true, reasonOf(args), actor);
     case "kill-switch-release":
       return setKillSwitchSinglePerson(s, false, reasonOf(args), actor);
+    case "kill-switch-release-status":
+      return releaseStatus(s);
     case "findings": {
       let q = s.db.selectFrom("audit_findings").selectAll().orderBy("created_at", "desc").limit(limitOf(o.limit));
       if (!o.all) q = q.where("result", "<>", "pass").where("acknowledged_at", "is", null);
@@ -216,6 +231,8 @@ async function run(
         throw new UsageError("minutes must be an integer from 1 to 10080");
       return quarantineChange(s, { account: ref, livemode: !o.test, minutes: m, note: reasonOf(note), actor });
     }
+    case "quarantine-clear-all":
+      return clearAllQuarantines(s, { livemode: !o.test, note: reasonOf(args), actor });
     default:
       throw new UsageError(cmd ? `unknown command ${cmd}` : "missing command");
   }
