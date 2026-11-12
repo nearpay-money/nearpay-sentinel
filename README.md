@@ -71,13 +71,13 @@ Needs Node 22 (`.nvmrc`) and pnpm 9. `.npmrc` points the `@nearpay-money` and `@
 
 ## Commands
 
-| Command | What it does |
-| --- | --- |
-| `pnpm install --frozen-lockfile` | Install; NearPay packages come from the local registry (see "Verify this repo") |
-| `pnpm test` | Unit and property tests |
-| `pnpm test:integration` | Integration and contract tests: Postgres, NATS, Valkey, Anvil and the `nearpay/sandbox:local` image in Testcontainers (needs Docker; build the sandbox image first) |
-| `pnpm verify` | typecheck + lint + unit tests with the coverage gate (≥ 90 % branches on the pure rules) + integration tests + build |
-| `docker build --network host --build-arg NP_REGISTRY_URL=http://127.0.0.1:4873 -t nearpay/sentinel:local .` | Image (what nearpay-deploy's `scripts/up.sh` runs) |
+| Command                                                                                                     | What it does                                                                                                                                                        |
+| ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm install --frozen-lockfile`                                                                            | Install; NearPay packages come from the local registry (see "Verify this repo")                                                                                     |
+| `pnpm test`                                                                                                 | Unit and property tests                                                                                                                                             |
+| `pnpm test:integration`                                                                                     | Integration and contract tests: Postgres, NATS, Valkey, Anvil and the `nearpay/sandbox:local` image in Testcontainers (needs Docker; build the sandbox image first) |
+| `pnpm verify`                                                                                               | typecheck + lint + unit tests with the coverage gate (≥ 90 % branches on the pure rules) + integration tests + build                                                |
+| `docker build --network host --build-arg NP_REGISTRY_URL=http://127.0.0.1:4873 -t nearpay/sentinel:local .` | Image (what nearpay-deploy's `scripts/up.sh` runs)                                                                                                                  |
 
 ## Configuration
 
