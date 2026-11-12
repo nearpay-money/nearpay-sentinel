@@ -6,10 +6,12 @@
  * or `test`; any other value is refused (`two_person_required`: the console's two-person release is the only one).
  */
 import { parseArgs } from "node:util";
-import { sql } from "@nearpay-internal/db";
+import { DEAD_LETTER_USAGE, DeadLetterError, KitOpsUsageError, runKitOps, sql } from "@nearpay-internal/db";
 import { fromUuid, isId, toUuid } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
+import type { Subject } from "@nearpay-internal/spec";
 import type { Sentinel } from "../app/context.js";
+import { sentinelHandlers } from "../consumers/handlers.js";
 import {
   changeQuarantine,
   clearAllQuarantines,
@@ -51,7 +53,10 @@ export const USAGE = `usage: ops.js <command> [arguments]
   A breach on one payment quarantines that account only (ADR-0028); quarantines expire on their own
   (NP_QUARANTINE_TTL_S); retries never extend one. Releasing the kill switch also lifts the quarantines sentinel
   set during the stop. The kill switch is engaged by sentinel only on corroborated breaches across accounts
-  and is released in the console (two-person / single-operator release).`;
+  and is released in the console (two-person / single-operator release).
+
+dead letters and the outbox (kit 0.6.0):
+${DEAD_LETTER_USAGE}`;
 
 class UsageError extends Error {}
 
@@ -61,10 +66,32 @@ export interface OpsDeps {
   err?: (line: string) => void;
 }
 
+const KIT_COMMANDS = new Set(["dead-letters", "outbox"]);
+
+/** `dead-letters …` / `outbox …` (kit `runKitOps`): consumer dead letters replay through the worker's handlers (inbox-deduped). */
+function kitOps(s: Sentinel, argv: readonly string[], actor: string): Promise<unknown> {
+  const handlers = sentinelHandlers(s.db, s.cache);
+  return runKitOps(s.db, argv[0] as string, argv.slice(1), {
+    actor,
+    handlers: {
+      consumer: async (e) => {
+        const h = handlers[e.subject as Subject];
+        if (!h) throw new DeadLetterError("no_handler", `sentinel does not consume ${e.subject}`);
+        await h(e);
+      },
+    },
+  });
+}
+
 export async function runOps(argv: readonly string[], s: Sentinel, deps: OpsDeps): Promise<number> {
   const out = deps.out ?? ((l: string) => process.stdout.write(`${l}\n`));
   const err = deps.err ?? ((l: string) => process.stderr.write(`${l}\n`));
   try {
+    if (KIT_COMMANDS.has(argv[0] ?? "")) {
+      const result = await kitOps(s, argv, deps.actor);
+      out(JSON.stringify(result, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
+      return 0;
+    }
     const { values, positionals } = parseArgs({
       args: [...argv],
       allowPositionals: true,
@@ -85,13 +112,18 @@ export async function runOps(argv: readonly string[], s: Sentinel, deps: OpsDeps
     const code = (e as { code?: string }).code;
     if (
       e instanceof UsageError ||
+      e instanceof KitOpsUsageError ||
       code === "ERR_PARSE_ARGS_UNKNOWN_OPTION" ||
       code === "ERR_PARSE_ARGS_INVALID_OPTION_VALUE"
     ) {
       err(`${e instanceof Error ? e.message : String(e)}\n\n${USAGE}`);
       return 2;
     }
-    err(JSON.stringify({ error: e instanceof ApiError ? { code: e.code, message: e.message } : String(e) }));
+    err(
+      JSON.stringify({
+        error: e instanceof ApiError || e instanceof DeadLetterError ? { code: e.code, message: e.message } : String(e),
+      }),
+    );
     return 1;
   }
 }
