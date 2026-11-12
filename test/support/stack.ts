@@ -322,6 +322,8 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     registryRereadMs: 20,
     registryMaxLagS: 5,
     registryRecentChangeS: 900,
+    killSwitchAutoReleaseTickS: 60,
+    killSwitchAutoReleaseMaxReengagements: 3,
     signingKeyPath: `/run/secrets/sentinel-${KID}.pem`,
     ...(valkey ? { valkeyUrl: valkey.url } : {}),
     ...(sandbox ? { sandboxBaseUrl: sandbox.url, sandboxSigningPubkey: sandbox.signingPubkey } : {}),

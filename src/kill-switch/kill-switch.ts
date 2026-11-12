@@ -4,7 +4,8 @@
  * Rails stops live quotes when it consumes `engaged`. From Stage 2 the console's two-person release
  * (./release.ts) is the only release on the server stage; the single-person release of the ops CLI and
  * `POST /internal/kill-switch` answers `409 two_person_required` there and stays on local/test stacks.
- * Every change also expires a pending release request (it was for the previous version).
+ * Every change also expires a pending release request (it was for the previous version). Sentinel itself
+ * releases a stale automatic stop through `setKillSwitch` (./auto-release.ts, owner decision 2026-11-13).
  *
  * Releasing (by any path) also clears, in the same transaction, the quarantines sentinel created during the
  * engagement (SENTINEL-2): the cause has been dealt with, so the merchants it paused resume with everyone

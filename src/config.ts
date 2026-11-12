@@ -3,7 +3,12 @@
 import { baseConfigShape, list, loadConfig, secret, url } from "@nearpay-internal/service";
 import { NearAccountId } from "@nearpay-money/spec";
 import { z } from "zod";
-import { type ContainmentPolicy, DEFAULT_CONTAINMENT } from "./address-integrity/containment.js";
+import {
+  type AutoReleasePolicy,
+  type ContainmentPolicy,
+  DEFAULT_AUTO_RELEASE,
+  DEFAULT_CONTAINMENT,
+} from "./address-integrity/containment.js";
 import { CLIENT_IP_HEADERS } from "./api/client-ip.js";
 
 const json = <T extends z.ZodType>(schema: T, fallback: string) =>
@@ -115,6 +120,13 @@ const shared = {
   integritySystemicAccounts: z.coerce.number().int().min(2).max(1000).default(2),
   integritySystemicWindowS: z.coerce.number().int().min(60).max(86_400).default(900),
   quarantineTtlS: z.coerce.number().int().min(60).max(604_800).default(1800),
+  /**
+   * Automatic release of stale automatic stops (owner decision 2026-11-13, ADR-0028 amendment): how often
+   * sentinel-auditor checks the switch (also once at boot), seconds; and the flap guard — after more than this
+   * many re-engagements following automatic releases within 1 h, sentinel stops releasing automatically.
+   */
+  killSwitchAutoReleaseTickS: z.coerce.number().int().min(5).max(3600).default(60),
+  killSwitchAutoReleaseMaxReengagements: z.coerce.number().int().min(0).max(100).default(3),
   /** R5 (ADR-0028): pause before re-reading identity's registry for a recipient it did not list, ms. */
   registryRereadMs: z.coerce.number().int().min(0).max(2000).default(250),
   /** R5: a registry replica further behind than this is `unavailable`, seconds. */
@@ -174,6 +186,16 @@ export function containmentPolicy(c: Partial<SharedConfig>): ContainmentPolicy {
     rereadMs: c.registryRereadMs ?? d.rereadMs,
     registryMaxLagMs: c.registryMaxLagS !== undefined ? c.registryMaxLagS * 1000 : d.registryMaxLagMs,
     registryRecentMs: c.registryRecentChangeS !== undefined ? c.registryRecentChangeS * 1000 : d.registryRecentMs,
+  };
+}
+
+/** The automatic-release policy from the configuration (defaults where a field is unset). */
+export function autoReleasePolicy(c: Partial<SharedConfig>): AutoReleasePolicy {
+  const d = DEFAULT_AUTO_RELEASE;
+  return {
+    tickMs: c.killSwitchAutoReleaseTickS !== undefined ? c.killSwitchAutoReleaseTickS * 1000 : d.tickMs,
+    maxReengagements: c.killSwitchAutoReleaseMaxReengagements ?? d.maxReengagements,
+    flapWindowMs: d.flapWindowMs,
   };
 }
 

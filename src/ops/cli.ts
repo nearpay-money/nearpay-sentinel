@@ -38,7 +38,8 @@ export const USAGE = `usage: ops.js <command> [arguments]
   kill-switch-engage <reason…>              stop live quoting now
   kill-switch-release <reason…>             resume live quoting (one operator; local/test stacks only)
   kill-switch-release-status                where a release stands: why payments are paused, whether that stop would
-                                            happen under the current rules, the pending request and when it can be
+                                            happen under the current rules, whether sentinel releases it by itself
+                                            (and when) or why not, the pending request and when it can be
                                             completed, and how many paused merchants the release switches back on
   findings [--all] [--limit N]              open (unacknowledged, non-pass) audit findings; --all: every finding
   finding-ack <fnd_…> <note…>               acknowledge a finding
@@ -53,7 +54,8 @@ export const USAGE = `usage: ops.js <command> [arguments]
   A breach on one payment quarantines that account only (ADR-0028); quarantines expire on their own
   (NP_QUARANTINE_TTL_S); retries never extend one. Releasing the kill switch also lifts the quarantines sentinel
   set during the stop. The kill switch is engaged by sentinel only on corroborated breaches across accounts
-  and is released in the console (two-person / single-operator release).
+  and is released in the console (two-person / single-operator release). A stop sentinel engaged that the
+  current rules would not engage (a false alarm) is released by sentinel itself within a minute.
 
 dead letters and the outbox (kit 0.6.0):
 ${DEAD_LETTER_USAGE}`;
