@@ -61,7 +61,8 @@ export interface Containment {
 }
 
 const SYSTEMIC_LOCK = "sentinel.integrity.systemic";
-const RUNBOOK = "scripts/beta.sh ops sentinel integrity-breaches; ops sentinel quarantines; runbook RB-11";
+const RUNBOOK =
+  "scripts/beta.sh ops sentinel integrity-breaches; ops sentinel quarantines; runbook RB-03 (sentinel mismatch)";
 
 const acctUuid = (id: string | null | undefined): string | null => (id && isId("acct", id) ? toUuid(id, "acct") : null);
 
