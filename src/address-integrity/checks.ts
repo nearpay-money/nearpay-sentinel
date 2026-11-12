@@ -301,11 +301,20 @@ export function checkRouteQuote(i: RouteQuoteInput): RouteOutcome {
     return { ok: false, class: "unavailable", reasons: [R2_DRIFT_REASON], drift: "R2" };
   if (pipeline.length) {
     const onlyR5 = unknown && pipeline.length === 1;
+    // a bad signature next to a rule that could not be verified stays a breach; the record says which rule, so
+    // it is never mistaken for (or re-read as) an R2-only refusal
+    const unverified =
+      pipeline.length === 1 && !i.signatureValid
+        ? [
+            ...unavailable,
+            ...(match.ok ? [] : [`R5 ${unknown && i.recipientUnknownAs ? i.recipientUnknownAs.reason : match.reason}`]),
+          ]
+        : [];
     return {
       ok: false,
       class: "security",
       evidence: "pipeline",
-      reasons: [...pipeline, ...request],
+      reasons: [...pipeline, ...request, ...unverified],
       ...(onlyR5 ? { recipientUnknown: true as const } : {}),
       ...(match.ok ? { row: match.row } : {}),
     };

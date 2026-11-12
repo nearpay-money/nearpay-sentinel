@@ -12,6 +12,7 @@ import {
   checkRouteQuote,
   instantNs,
   matchRegistry,
+  R2_DRIFT_REASON,
   type RegistryRow,
   type RouteQuoteInput,
   recipientIsListed,
@@ -122,7 +123,7 @@ describe("route_quote checks", () => {
   });
 
   const security: [string, Partial<Parameters<typeof input>[0]>, RegExp][] = [
-    ["R2 signature", { signatureValid: false }, /^R2 /],
+    ["R2 signature with another failure", { signatureValid: false, registry: [] }, /^R2 /],
     ["R3 referral", { q: quote((q) => (q.quoteRequest.referral = "someone")) }, /^R3 /],
     ["R3 no referral", { q: quote((q) => delete q.quoteRequest.referral) }, /^R3 /],
     [
@@ -449,6 +450,60 @@ describe("asset ids", () => {
   });
 });
 
+describe("SENTINEL-1: R2 alone, with every other check passing, is provider echo drift (unavailable)", () => {
+  it("R2-false with every other rule passing → unavailable, drift R2, no evidence and no row", () => {
+    expect(checkRouteQuote(input({ signatureValid: false }))).toEqual({
+      ok: false,
+      class: "unavailable",
+      reasons: [R2_DRIFT_REASON],
+      drift: "R2",
+    });
+    // also when the quote is otherwise closed or near its deadline: drift is reported, nothing signs
+    expect(checkRouteQuote(input({ signatureValid: false, status: "SUCCESS" }))).toMatchObject({ drift: "R2" });
+  });
+
+  const withDeposit = (patch: Partial<RouteQuoteInput["deposit"]>, o: Parameters<typeof input>[0] = {}) => {
+    const i = input(o);
+    return checkRouteQuote({ ...i, deposit: { ...i.deposit, ...patch } });
+  };
+
+  it.each([
+    ["an R4 deposit-address mismatch", { q: quote((q) => (q.quote.depositAddress = `0x${"b".repeat(40)}`)) }],
+    ["an R4 memo mismatch", { q: quote((q) => (q.quote.depositMemo = "1")) }],
+    ["an R3 referral", { q: quote((q) => (q.quoteRequest.referral = "x")) }],
+    ["an R4 address lifetime", { q: quote((q) => (q.quote.deadline = "2026-11-05T18:00:00.000Z")) }],
+    ["an R6 fee", { q: quote((q) => (q.quoteRequest.appFees = [{ recipient: "attacker.near", fee: 50 }])) }],
+    ["an unknown R5 recipient", { registry: [] }],
+  ] as [string, Parameters<typeof input>[0]][])("R2-false plus %s stays pipeline security", (_n, o) => {
+    const r = checkRouteQuote(input({ ...o, signatureValid: false }));
+    expect(r).toMatchObject({ ok: false, class: "security", evidence: "pipeline" });
+    expect(r).not.toHaveProperty("drift");
+    if (!r.ok) expect(r.reasons[0]).toBe("R2 provider signature does not verify");
+  });
+
+  it("R2-false plus any caller-supplied mismatch stays a breach (any other field mismatch)", () => {
+    expect(withDeposit({ amount_in: "1" }, { signatureValid: false })).toMatchObject({
+      class: "security",
+      evidence: "pipeline",
+      reasons: ["R2 provider signature does not verify", "R4 amount differs"],
+    });
+  });
+
+  it("R2-false where another rule could not be verified stays a breach (no treasury, unreadable value, R5 not matched)", () => {
+    for (const o of [
+      { treasury: null },
+      { q: quote((q) => delete q.quote.deadline) },
+      { registry: [row({ status: "disabled" })] },
+      { registry: [row({ verification: "unverified" }), row({ id: "x", verification: "unverified" })] },
+      { registry: [], recipientUnknownAs: { class: "stale" as const, reason: "lag" } },
+    ] as Parameters<typeof input>[0][])
+      expect(checkRouteQuote(input({ ...o, signatureValid: false }))).toMatchObject({
+        class: "security",
+        evidence: "pipeline",
+      });
+  });
+});
+
 describe("classification (ADR-0028): evidence, canonical comparisons, configuration and provider shape", () => {
   const withDeposit = (patch: Partial<RouteQuoteInput["deposit"]>, o: Parameters<typeof input>[0] = {}) => {
     const i = input(o);
@@ -456,7 +511,7 @@ describe("classification (ADR-0028): evidence, canonical comparisons, configurat
   };
 
   it.each([
-    ["R2 signature", { signatureValid: false }],
+    ["R2 signature with an R4 memo mismatch", { signatureValid: false, q: quote((q) => (q.quote.depositMemo = "9")) }],
     ["R3 referral", { q: quote((q) => (q.quoteRequest.referral = "someone")) }],
     ["R4 address", { q: quote((q) => (q.quote.depositAddress = "0x0000000000000000000000000000000000000bad")) }],
     ["R4 memo", { q: quote((q) => (q.quote.depositMemo = "123")) }],
@@ -510,7 +565,12 @@ describe("classification (ADR-0028): evidence, canonical comparisons, configurat
       checkRouteQuote(
         input({ registry: [], signatureValid: false, recipientUnknownAs: { class: "stale", reason: "x" } }),
       ),
-    ).toMatchObject({ class: "security", evidence: "pipeline", reasons: ["R2 provider signature does not verify"] });
+    ).toMatchObject({
+      class: "security",
+      evidence: "pipeline",
+      // the record names the rule that could not be verified next to the signature
+      reasons: ["R2 provider signature does not verify", "R5 x"],
+    });
     // a re-read verdict does not apply when the recipient matched
     expect(checkRouteQuote(input({ recipientUnknownAs: { class: "stale", reason: "x" } }))).toEqual({
       ok: true,

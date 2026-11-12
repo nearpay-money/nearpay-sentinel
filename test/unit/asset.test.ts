@@ -11,6 +11,8 @@ import {
   TOKENS_FRESH_MS,
   TOKENS_MAX_AGE_MS,
   TOKENS_MISS_REFRESH_MS,
+  TOKENS_RETRY_MS,
+  type TokenListStore,
   TokensUnavailable,
   tokenMap,
 } from "../../src/infra/clients/tokens.js";
@@ -129,6 +131,105 @@ describe("token registry", () => {
     expect(calls).toBe(2);
     now = TOKENS_MISS_REFRESH_MS + 1;
     expect(await r.asset("nep141:new.near")).toMatchObject({ symbol: "USDC", decimals: 18 });
+  });
+
+  it("SENTINEL-4: a failed refresh is not retried for 30 s (negative cache), with or without a list", async () => {
+    let now = 0;
+    let calls = 0;
+    let fail = true;
+    const r = cachedTokenRegistry(
+      async () => {
+        calls++;
+        if (fail) throw new Error("down");
+        return [entry(USDC)];
+      },
+      () => now,
+    );
+    await expect(r.asset(USDC)).rejects.toThrow(TokensUnavailable);
+    expect(calls).toBe(1);
+    now = TOKENS_RETRY_MS - 1;
+    await expect(r.asset(USDC)).rejects.toThrow(/next attempt within 30 s/);
+    expect(calls).toBe(1); // the second call within 30 s does not fetch
+    now = TOKENS_RETRY_MS;
+    fail = false;
+    expect(await r.asset(USDC)).toMatchObject({ symbol: "USDC" });
+    expect(calls).toBe(2);
+    // stale list + failing provider: served at once, one attempt per 30 s
+    fail = true;
+    now += TOKENS_FRESH_MS;
+    expect(await r.asset(USDC)).toMatchObject({ symbol: "USDC" });
+    await new Promise((res) => setTimeout(res, 0));
+    expect(calls).toBe(3);
+    now += TOKENS_RETRY_MS - 1;
+    expect(await r.asset(USDC)).toMatchObject({ symbol: "USDC" });
+    expect(calls).toBe(3);
+  });
+
+  it("SENTINEL-4: a stale list is served immediately and refreshed in the background", async () => {
+    let now = 0;
+    let release: (v: unknown) => void = () => {};
+    let calls = 0;
+    const r = cachedTokenRegistry(
+      async () => {
+        calls++;
+        if (calls === 1) return [entry(USDC)];
+        return new Promise((res) => {
+          release = res;
+        });
+      },
+      () => now,
+    );
+    await r.asset(USDC);
+    now = TOKENS_FRESH_MS + 1;
+    // the refresh hangs (1Click slow): the attestation does not wait for it
+    expect(await r.asset(USDC)).toMatchObject({ decimals: 6 });
+    expect(calls).toBe(2);
+    // a second stale read joins the same refresh instead of starting another
+    expect(await r.asset(USDC)).toMatchObject({ decimals: 6 });
+    expect(calls).toBe(2);
+    release([entry(USDC, 18)]);
+    await new Promise((res) => setTimeout(res, 0));
+    expect(await r.asset(USDC)).toMatchObject({ decimals: 18 });
+  });
+
+  it("SENTINEL-4: boot with a persisted list and a failing fetch serves it (within 6 h); a good fetch is saved", async () => {
+    let now = 10 * TOKENS_MAX_AGE_MS;
+    const saved: { body: unknown; atMs: number }[] = [];
+    const store = (atMs: number): TokenListStore => ({
+      load: async () => ({ body: [entry(USDC)], atMs }),
+      save: async (body, at) => {
+        saved.push({ body, atMs: at });
+      },
+    });
+    let fail = true;
+    const fetchList = async () => {
+      if (fail) throw new Error("down");
+      return [entry(USDC, 18)];
+    };
+    const r = cachedTokenRegistry(fetchList, () => now, store(now - TOKENS_MAX_AGE_MS + 60_000));
+    expect(await r.asset(USDC)).toMatchObject({ symbol: "USDC", decimals: 6 });
+    // too old to trust: fail closed
+    const old = cachedTokenRegistry(fetchList, () => now, store(now - TOKENS_MAX_AGE_MS));
+    await expect(old.asset(USDC)).rejects.toThrow(TokensUnavailable);
+    // an unreadable store is ignored
+    const broken = cachedTokenRegistry(fetchList, () => now, {
+      load: async () => {
+        throw new Error("db down");
+      },
+      save: async () => {},
+    });
+    await expect(broken.asset(USDC)).rejects.toThrow(TokensUnavailable);
+    // a successful fetch persists the list
+    fail = false;
+    now += TOKENS_RETRY_MS;
+    const fresh = cachedTokenRegistry(fetchList, () => now, {
+      load: async () => null,
+      save: async (body, at) => {
+        saved.push({ body, atMs: at });
+      },
+    });
+    expect(await fresh.asset(USDC)).toMatchObject({ decimals: 18 });
+    expect(saved).toEqual([{ body: [entry(USDC, 18)], atMs: now }]);
   });
 
   it("no list at all is unavailable", async () => {
