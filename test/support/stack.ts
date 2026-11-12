@@ -177,8 +177,11 @@ export interface Stack {
   readonly sentinel: Sentinel;
   readonly apiUrl: string;
   readonly rails: MockPeer;
-  /** Deposit addresses rails "issued" (lookupExecutionByDeposit answers exists for these). */
-  readonly issued: Map<string, { livemode: boolean }>;
+  /**
+   * Deposit addresses rails "issued" (lookupExecutionByDeposit answers exists for these), with the execution's
+   * account and id (random when absent).
+   */
+  readonly issued: Map<string, { livemode: boolean; account_id?: string; execution_id?: string }>;
   readonly sandbox: Sandbox | null;
   readonly nats: (Started & { monitorUrl: string }) | null;
   readonly valkey: Started | null;
@@ -190,6 +193,8 @@ export interface Stack {
   readonly registryOwner: Database<Record<string, never>>;
   /** Restores the default rails mock (after a test reset it). */
   mockRails(): void;
+  /** Forgets integrity breaches and quarantines (append-only tables: truncated as the database owner). */
+  resetContainment(): Promise<void>;
   /** Inserts a registry row (identity's side) and returns its uuid. */
   destination(d: Destination): Promise<string>;
   setDestinationStatus(id: string, status: string, disabledAt?: Date | null): Promise<void>;
@@ -234,7 +239,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     o.worker ? startNats() : null,
     o.valkey ? startValkey() : null,
   ]);
-  const { migratorUrl, appUrl } = await provisionServiceDatabase(pg.url, "sentinel");
+  const { migratorUrl, appUrl, adminUrl } = await provisionServiceDatabase(pg.url, "sentinel");
   const migrator = createDb<DB>({ url: migratorUrl });
   await migrate(migrator.db, MIGRATIONS_DIR);
   await migrator.close();
@@ -250,13 +255,18 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
   const jwksUrl = `http://127.0.0.1:${(jwks.address() as AddressInfo).port}/internal/jwks`;
   const sandbox = o.sandbox ? await startSandbox(pg.url, jwksUrl) : null;
 
-  const issued = new Map<string, { livemode: boolean }>();
+  const issued = new Map<string, { livemode: boolean; account_id?: string; execution_id?: string }>();
   const rails = await mockPeer({ service: "rails", routes: INTERNAL_ROUTES });
   const mockRails = () => {
     rails.on(lookupExecutionByDeposit, async (ctx) => {
       const hit = issued.get(ctx.query.deposit_address);
       return hit
-        ? { exists: true, execution_id: newId("ex"), account_id: newId("acct"), livemode: hit.livemode }
+        ? {
+            exists: true,
+            execution_id: (hit.execution_id ?? newId("ex")) as `ex_${string}`,
+            account_id: (hit.account_id ?? newId("acct")) as `acct_${string}`,
+            livemode: hit.livemode,
+          }
         : { exists: false, execution_id: null, account_id: null, livemode: null };
     });
     rails.on(getInternalAsset, async (ctx) => ({
@@ -380,6 +390,15 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     account,
     registryOwner: owner,
     mockRails,
+    async resetContainment() {
+      const su = createDb<Record<string, never>>({ url: adminUrl });
+      try {
+        await sql`truncate integrity_breaches, quarantines, quarantine_log cascade`.execute(su.db);
+        await sql`delete from audit_findings where check_kind = 'attestation'`.execute(su.db);
+      } finally {
+        await su.close();
+      }
+    },
     async destination(d) {
       const id = d.id ?? uuidv7();
       await sql`
