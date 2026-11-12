@@ -5,7 +5,7 @@ import type { Kysely, Transaction } from "@nearpay-internal/db";
 import type { Logger, ServiceMetrics } from "@nearpay-internal/service";
 import { Redis } from "ioredis";
 import type { ProviderSplit } from "../address-integrity/checks.js";
-import type { ContainmentPolicy } from "../address-integrity/containment.js";
+import { type AutoReleasePolicy, type ContainmentPolicy, STALE_CLASSES } from "../address-integrity/containment.js";
 import type { ClientIpRule } from "../api/client-ip.js";
 import type { SigningKey } from "../co-signer/crypto.js";
 import type { EsploraReader, EvmReader, NearReader, SolanaReader } from "../infra/clients/chains.js";
@@ -39,6 +39,8 @@ export interface SentinelMetrics {
   integrityDrift(source: "r2_only" | "pattern" | "engaged", rules: string): void;
   /** Quarantines lifted in bulk (`quarantines_cleared_total{by}`): `release`, `drift`, `ops_all`. */
   quarantinesCleared(by: "release" | "drift" | "ops_all", n: number): void;
+  /** Sentinel released a stale automatic stop by itself (`kill_switch_auto_released_total{reason_class}`, 2026-11-13). */
+  killSwitchAutoReleased(reasonClass: string): void;
 }
 
 /** Attestation outcomes pre-created at zero so `increase()` sees the first failure (SENTINEL-3). */
@@ -83,6 +85,7 @@ export const noMetrics: SentinelMetrics = {
   systemicEngaged() {},
   integrityDrift() {},
   quarantinesCleared() {},
+  killSwitchAutoReleased() {},
 };
 
 /** Service metrics (§12). The kill-switch gauge is read from the database on every scrape. */
@@ -167,6 +170,12 @@ export function sentinelMetrics(
     "Quarantines lifted in bulk: on a kill-switch release, on drift classification, by ops quarantine-clear-all.",
     ["by"],
   );
+  const autoReleased = m.counter(
+    "kill_switch_auto_released_total",
+    "Stale automatic stops sentinel released by itself (owner decision 2026-11-13), by why the current rules would not engage them.",
+    ["reason_class"],
+  );
+  for (const reason_class of STALE_CLASSES) autoReleased.inc({ reason_class }, 0);
   const feeConfig = m.gauge(
     "fee_config_info",
     "1 for the fingerprint of sentinel's treasury/referral/provider-split configuration (rails exposes the same; alert on more than one).",
@@ -183,6 +192,7 @@ export function sentinelMetrics(
   return {
     integrityDrift: (source, rules) => drift.inc({ source, rules }),
     quarantinesCleared: (by, n) => cleared.inc({ by }, n),
+    killSwitchAutoReleased: (reason_class) => autoReleased.inc({ reason_class }),
     integrityRefusal: (livemode, evidence, rule, address) =>
       refusals.inc({ livemode: String(livemode), evidence, rule, address }),
     systemicEngaged: () => systemic.inc(),
@@ -302,6 +312,8 @@ export interface Sentinel {
   readonly singleOperator: SingleOperatorPolicy;
   /** Integrity containment: quarantine TTL, corroboration thresholds, R5 re-read (ADR-0028). */
   readonly containment: ContainmentPolicy;
+  /** Automatic release of stale automatic stops (2026-11-13): tick and flap guard; default `DEFAULT_AUTO_RELEASE`. */
+  readonly autoRelease?: AutoReleasePolicy;
   readonly random: () => number;
   readonly now: () => number;
 }

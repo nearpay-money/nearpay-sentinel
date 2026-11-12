@@ -2,7 +2,8 @@
  * Process wiring (lld/sentinel.md §2):
  * - `api`     co-signing (`POST /v1/attestations/deposit_instructions`), keys, ops kill switch
  * - `worker`  (`sentinel-auditor`) consumers (settled → audit job; destination disabled → cache
- *             eviction), jobs, outbox relay (kill-switch and finding events)
+ *             eviction), jobs, outbox relay (kill-switch and finding events), automatic release of stale
+ *             automatic stops (kill-switch/auto-release.ts)
  */
 
 import { hostname } from "node:os";
@@ -38,6 +39,7 @@ import { type KeyInfo, sentinelRoutes } from "../api/routes.js";
 import { ed25519PublicKey, loadSigningKey } from "../co-signer/crypto.js";
 import {
   type ApiConfig,
+  autoReleasePolicy,
   bitcoinEsploraUrls,
   containmentPolicy,
   evmRpcUrls,
@@ -64,6 +66,7 @@ import { oneClickTokens, sandboxTokenRegistry, type TokenRegistry } from "../inf
 import { MIGRATIONS_DIR } from "../infra/db/migrations.js";
 import type { DB, RegistryDB } from "../infra/db/schema.js";
 import { dbTokenListStore } from "../infra/db/token-store.js";
+import { autoReleaseTask } from "../kill-switch/auto-release.js";
 import { quarantinesActive, systemicWindow } from "../kill-switch/containment.js";
 import { killSwitchState } from "../kill-switch/kill-switch.js";
 import { jobHandlers, RECURRING } from "../workers/jobs.js";
@@ -251,6 +254,7 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
     auditAlwaysUsdMicros: BigInt(Math.round(config.auditAlwaysUsd * 1_000_000)),
     singleOperator: { delayMs: (config.opsSingleOperatorDelayS ?? 300) * 1000 },
     containment: containmentPolicy(config),
+    autoRelease: autoReleasePolicy(config),
     random: deps.random ?? Math.random,
     now: deps.now ?? Date.now,
   };
@@ -333,6 +337,8 @@ export function createApi(config: ApiConfig, deps: ServiceDeps = {}): { service:
 export interface WorkerDeps extends ServiceDeps {
   bus?: Bus;
   tickMs?: number;
+  /** Automatic-release check period override (tests); default `NP_KILL_SWITCH_AUTO_RELEASE_TICK_S`. */
+  autoReleaseTickMs?: number;
 }
 
 export async function createWorker(
@@ -393,6 +399,8 @@ export async function createWorker(
       ...(deps.tickMs ? { tickMs: deps.tickMs } : {}),
     }),
   );
+  // stale automatic stops release themselves (owner decision 2026-11-13): once at boot, then every tick
+  service.addBackground(autoReleaseTask(s, deps.autoReleaseTickMs ? { tickMs: deps.autoReleaseTickMs } : {}));
   if (!deps.bus) service.onShutdown(() => bus.close());
   return { service, sentinel: s };
 }

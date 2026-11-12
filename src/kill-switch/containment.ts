@@ -76,7 +76,8 @@ export interface Containment {
   readonly drift: boolean;
 }
 
-const SYSTEMIC_LOCK = "sentinel.integrity.systemic";
+/** Advisory lock of the corroboration decision (also taken by the automatic release, before the switch row). */
+export const SYSTEMIC_LOCK = "sentinel.integrity.systemic";
 const RUNBOOK =
   "scripts/beta.sh ops sentinel integrity-breaches; ops sentinel quarantines; runbook RB-03 (sentinel mismatch)";
 const DRIFT_HINT =

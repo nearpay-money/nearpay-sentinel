@@ -201,37 +201,266 @@ export interface Engagement {
 export const SYSTEMIC_REASON_PREFIX = "systemic integrity breach";
 
 /**
- * Diagnostic for the operator (ops CLI `kill-switch-release-status`): would this engagement still engage the
- * switch under the current rules? It only informs the person deciding on the release; it never releases
- * anything. `breaches` are the recorded pipeline breaches on genuine live addresses up to the engagement
- * (already filtered with {@link stillPipelineBreach}).
+ * The reason sentinel wrote when one payment's check engaged the switch (before ADR-0028; the 2026-11-11
+ * incident "integrity breach on 0x11D2…5036: R4 deposit chain differs"): the deposit address, then the
+ * refusal's reasons joined with "; ". Sentinel has never written any other non-systemic reason.
+ */
+const SINGLE_CHECK_REASON = /^integrity breach on (\S+): (.+)$/s;
+
+/** Caller-supplied fields (ADR-0028 decision 2: request evidence, never a stop). */
+const REQUEST_REASONS: ReadonlySet<string> = new Set([
+  "R4 origin asset differs",
+  "R4 amount differs",
+  "R4 deposit chain differs",
+  "R4 deadline differs",
+]);
+
+/**
+ * Why a stale automatic stop would not happen under the current rules (label `reason_class` of
+ * `kill_switch_auto_released_total`):
+ * - `omdep_misparse`: one payment's "R4 deposit chain differs" (the 2026-11-11 incident: the old parser read a
+ *   `.omdep.near` asset id as a NEAR token; spec 0.5.2 fixed it, and the chain is caller-supplied anyway);
+ * - `request_evidence`: one payment's caller-supplied fields only;
+ * - `drift`: provider-format drift (one payment's drift-eligible reasons, or a systemic window whose refusals
+ *   are drift-classified or R2-only echo drift);
+ * - `single_breach`: any other single payment's check (one payment never stops the platform now);
+ * - `null_account`: a systemic window that reached the account threshold only by counting unknown accounts;
+ * - `uncorroborated`: a systemic window that is not corroborated across merchants under the current rules.
+ */
+export type StaleClass =
+  | "omdep_misparse"
+  | "request_evidence"
+  | "drift"
+  | "single_breach"
+  | "null_account"
+  | "uncorroborated";
+
+export const STALE_CLASSES: readonly StaleClass[] = [
+  "omdep_misparse",
+  "request_evidence",
+  "drift",
+  "single_breach",
+  "null_account",
+  "uncorroborated",
+];
+
+/** Why a stop is kept: an operator's, still corroborated, or not judgeable (fail closed). */
+export type KeepReason = "operator" | "corroborated" | "unjudgeable";
+
+export type StopVerdict =
+  | { readonly stale: true; readonly why: string; readonly class: StaleClass }
+  | { readonly stale: false; readonly why: string; readonly keep: KeepReason };
+
+/** Recorded rows of an engagement's window that the current rules no longer read as pipeline breaches. */
+export interface Reclassified {
+  /** R2-only refusals on a matched recipient recorded before SENTINEL-1 (provider echo drift). */
+  readonly r2Only?: number;
+  /** Request-evidence (caller-supplied) refusals. */
+  readonly request?: number;
+}
+
+function singleCheckClass(reasons: readonly string[]): StaleClass {
+  if (reasons.length > 0 && reasons.every((r) => r === "R4 deposit chain differs")) return "omdep_misparse";
+  if (reasons.length > 0 && reasons.every((r) => REQUEST_REASONS.has(r))) return "request_evidence";
+  if (driftSignature(reasons) !== null) return "drift";
+  return "single_breach";
+}
+
+/** The engagement's own window: breaches up to it (1 s of slack: the engaging breach is written a few ms first). */
+function engagementWindow(e: Engagement, breaches: readonly Breach[], p: ContainmentPolicy) {
+  const at = e.atMs + 1_000;
+  const wp = { ...p, systemicWindowMs: p.systemicWindowMs + 1_000 };
+  const window = breaches.filter((b) => b.atMs <= at && at - b.atMs <= wp.systemicWindowMs);
+  return { at, wp, window };
+}
+
+/**
+ * Would this engagement still engage the switch under the current rules (ADR-0028 and its amendment)?
+ * `breaches` are the recorded pipeline breaches on genuine live addresses around the engagement (already
+ * filtered with {@link stillPipelineBreach}); `reclassified` counts the window's recorded rows the current rules
+ * no longer read as pipeline breaches. Used by the automatic release ({@link autoReleaseDecision}) and by the ops
+ * CLI `kill-switch-release-status`.
  *
  * - An operator's engagement is never stale (people decide; only they release it).
- * - A sentinel engagement that is not a systemic one is a single payment's check (the rule before ADR-0028,
- *   e.g. the 2026-11-11 "integrity breach on 0x11D2…: R4 deposit chain differs"): stale.
- * - A systemic engagement is re-evaluated on its window: still corroborated (drift excluded) → kept; no
- *   longer → stale. When no breach of its window is on record it cannot be re-evaluated → kept (fail closed).
+ * - A sentinel engagement must carry a reason sentinel writes; any other reason cannot be judged → kept.
+ * - One payment's check (the rule before ADR-0028): stale, unless breaches on record in its window are
+ *   corroborated under the current rules (then kept).
+ * - A systemic engagement is re-evaluated on its window: still corroborated (drift excluded) → kept; no longer →
+ *   stale. When nothing of its window is on record it cannot be re-evaluated → kept (fail closed).
  */
 export function staleAutomaticStop(
   e: Engagement,
   breaches: readonly Breach[],
   p: ContainmentPolicy,
-): { readonly stale: boolean; readonly why: string } {
-  if (e.actor !== "sentinel") return { stale: false, why: "an operator engaged it" };
-  if (!e.reason.startsWith(SYSTEMIC_REASON_PREFIX))
-    return { stale: true, why: "it was engaged by a single payment's check, which never stops the platform now" };
-  // the engaging breach is written in the same transaction a few ms before the switch row: 1 s of slack
-  const at = e.atMs + 1_000;
-  const window = breaches.filter((b) => b.atMs <= at && at - b.atMs <= p.systemicWindowMs + 1_000);
-  if (window.length === 0) return { stale: false, why: "its breaches are not on record, so it cannot be re-checked" };
-  const v = systemicVerdict(window, { ...p, systemicWindowMs: p.systemicWindowMs + 1_000 }, at);
-  return v.engage
-    ? { stale: false, why: `still corroborated: ${v.refusals} refusals across ${v.accounts} merchants` }
-    : {
-        stale: true,
-        why:
-          v.drift.length > 0
-            ? "its refusals were the same provider-format change on every merchant, not tampering"
-            : "its refusals are no longer corroborated across merchants under the current rules",
+  reclassified: Reclassified = {},
+): StopVerdict {
+  if (e.actor !== "sentinel") return { stale: false, keep: "operator", why: "an operator engaged it" };
+  const { at, wp, window } = engagementWindow(e, breaches, p);
+  const v = window.length > 0 ? systemicVerdict(window, wp, at) : null;
+  const corroborated = (n: SystemicVerdict) =>
+    ({
+      stale: false,
+      keep: "corroborated",
+      why: `still corroborated: ${n.refusals} refusals across ${n.accounts} merchants`,
+    }) as const;
+
+  if (!e.reason.startsWith(SYSTEMIC_REASON_PREFIX)) {
+    const m = SINGLE_CHECK_REASON.exec(e.reason);
+    if (!m)
+      return {
+        stale: false,
+        keep: "unjudgeable",
+        why: "its reason is not one sentinel writes, so it cannot be checked against the current rules",
       };
+    if (v?.engage) return corroborated(v);
+    return {
+      stale: true,
+      class: singleCheckClass((m[2] as string).split("; ")),
+      why: "it was engaged by a single payment's check, which never stops the platform now",
+    };
+  }
+
+  if (v === null) {
+    const r2 = reclassified.r2Only ?? 0;
+    const req = reclassified.request ?? 0;
+    if (r2 + req === 0)
+      return { stale: false, keep: "unjudgeable", why: "its breaches are not on record, so it cannot be re-checked" };
+    return {
+      stale: true,
+      class: r2 > 0 ? "drift" : "request_evidence",
+      why:
+        r2 > 0
+          ? "its refusals were the provider's signature echo changing, which is not tampering under the current rules"
+          : "its refusals were about fields the payer's browser sent, which never stop the platform now",
+    };
+  }
+  if (v.engage) return corroborated(v);
+  if (v.drift.length > 0)
+    return {
+      stale: true,
+      class: "drift",
+      why: "its refusals were the same provider-format change on every merchant, not tampering",
+    };
+  const unknown = window.some((b) => b.account === null);
+  if (unknown && v.refusals >= Math.max(2, p.systemicRefusals))
+    return {
+      stale: true,
+      class: "null_account",
+      why: "it counted refusals whose merchant is unknown as extra merchants; under the current rules they are not",
+    };
+  return {
+    stale: true,
+    class: "uncorroborated",
+    why: "its refusals are no longer corroborated across merchants under the current rules",
+  };
+}
+
+// ------------------------------------------------------------------------- automatic release (2026-11-13)
+
+/**
+ * Automatic release of stale automatic stops (owner decision 2026-11-13; ADR-0028 amendment 2026-11-13):
+ * `NP_KILL_SWITCH_AUTO_RELEASE_TICK_S`, `NP_KILL_SWITCH_AUTO_RELEASE_MAX_REENGAGEMENTS`.
+ */
+export interface AutoReleasePolicy {
+  /** How often sentinel-auditor checks the switch (also once at boot). */
+  readonly tickMs: number;
+  /** Flap guard: auto-release → re-engagement cycles tolerated within `flapWindowMs`; more → no auto-release. */
+  readonly maxReengagements: number;
+  readonly flapWindowMs: number;
+}
+
+export const DEFAULT_AUTO_RELEASE: AutoReleasePolicy = {
+  tickMs: 60_000,
+  maxReengagements: 3,
+  flapWindowMs: 60 * 60_000,
+};
+
+export const AUTO_RELEASE_PREFIX = "auto-released: ";
+export const AUTO_RELEASE_SUFFIX = " — no longer platform evidence under ADR-0028";
+const REASON_MAX = 500;
+
+/** The `kill_switch_log` reason of an automatic release, within the 500-character column (old reason shortened). */
+export function autoReleaseReason(old: string): string {
+  const room = REASON_MAX - AUTO_RELEASE_PREFIX.length - AUTO_RELEASE_SUFFIX.length;
+  const kept = old.length > room ? `${old.slice(0, room - 1)}…` : old;
+  return `${AUTO_RELEASE_PREFIX}${kept}${AUTO_RELEASE_SUFFIX}`;
+}
+
+/** A `kill_switch_log` row, as the flap guard reads it. */
+export interface SwitchLogEntry {
+  readonly version: number;
+  readonly engaged: boolean;
+  readonly actor: string;
+  readonly reason: string;
+  readonly atMs: number;
+}
+
+const isAutoRelease = (r: SwitchLogEntry) =>
+  !r.engaged && r.actor === "sentinel" && r.reason.startsWith(AUTO_RELEASE_PREFIX);
+
+/**
+ * Flap guard input: how many times sentinel engaged the switch again right after one of its automatic releases,
+ * with the re-engagement inside `[now − windowMs, now]`.
+ */
+export function reengagementsAfterAutoRelease(log: readonly SwitchLogEntry[], nowMs: number, windowMs: number): number {
+  const rows = [...log].sort((x, y) => x.version - y.version);
+  let n = 0;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] as SwitchLogEntry;
+    const prev = rows[i - 1] as SwitchLogEntry;
+    if (r.engaged && r.actor === "sentinel" && isAutoRelease(prev) && r.atMs <= nowMs && nowMs - r.atMs <= windowMs)
+      n++;
+  }
+  return n;
+}
+
+export type AutoReleaseDecision =
+  | { readonly release: true; readonly class: StaleClass; readonly why: string }
+  | {
+      readonly release: false;
+      readonly keep: KeepReason | "new_evidence" | "flapping";
+      readonly why: string;
+    };
+
+/**
+ * Should sentinel release the engaged global switch by itself? Only a stale automatic stop
+ * ({@link staleAutomaticStop}: engaged by sentinel, and its recorded reason and evidence would not engage the
+ * switch under the current rules), and only when:
+ * - no corroborated systemic evidence arrived after it (each later breach re-evaluates the window ending there:
+ *   the systemic rule cannot engage an engaged switch again, so such evidence would otherwise be lost);
+ * - the flap guard holds: sentinel re-engaged after its automatic releases at most `maxReengagements` times
+ *   within `flapWindowMs`.
+ * Never: an operator's stop, a still-corroborated systemic stop, or a stop whose evidence cannot be judged.
+ * `breaches` cover `[engagement − window − 1 s, now]`.
+ */
+export function autoReleaseDecision(i: {
+  readonly engagement: Engagement;
+  readonly breaches: readonly Breach[];
+  readonly reclassified?: Reclassified;
+  readonly log: readonly SwitchLogEntry[];
+  readonly containment: ContainmentPolicy;
+  readonly policy: AutoReleasePolicy;
+  readonly nowMs: number;
+}): AutoReleaseDecision {
+  const v = staleAutomaticStop(i.engagement, i.breaches, i.containment, i.reclassified);
+  if (!v.stale) return { release: false, keep: v.keep, why: v.why };
+  const since = i.engagement.atMs + 1_000;
+  for (const b of i.breaches) {
+    if (b.atMs <= since || b.atMs > i.nowMs) continue;
+    const later = systemicVerdict(i.breaches, i.containment, b.atMs);
+    if (later.engage)
+      return {
+        release: false,
+        keep: "new_evidence",
+        why: `new corroborated evidence arrived during the stop: ${later.refusals} refusals across ${later.accounts} merchants`,
+      };
+  }
+  const flaps = reengagementsAfterAutoRelease(i.log, i.nowMs, i.policy.flapWindowMs);
+  if (flaps > i.policy.maxReengagements)
+    return {
+      release: false,
+      keep: "flapping",
+      why: `the switch was engaged again ${flaps} times within ${Math.round(i.policy.flapWindowMs / 60_000)} min after automatic releases (more than ${i.policy.maxReengagements}), so automatic release is paused`,
+    };
+  return { release: true, class: v.class, why: v.why };
 }

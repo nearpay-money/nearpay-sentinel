@@ -195,6 +195,10 @@ export interface Stack {
   mockRails(): void;
   /** Forgets integrity breaches and quarantines (append-only tables: truncated as the database owner). */
   resetContainment(): Promise<void>;
+  /** Forgets the kill-switch history (`kill_switch_log`, append-only: truncated as the database owner). */
+  resetKillSwitchLog(): Promise<void>;
+  /** Starts another worker process (sentinel-auditor) on the same databases and bus; needs `worker` in the options. */
+  startWorker(over?: WorkerDeps): Promise<{ service: Service; sentinel: Sentinel }>;
   /** Inserts a registry row (identity's side) and returns its uuid. */
   destination(d: Destination): Promise<string>;
   setDestinationStatus(id: string, status: string, disabledAt?: Date | null): Promise<void>;
@@ -322,6 +326,8 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     registryRereadMs: 20,
     registryMaxLagS: 5,
     registryRecentChangeS: 900,
+    killSwitchAutoReleaseTickS: 60,
+    killSwitchAutoReleaseMaxReengagements: 3,
     signingKeyPath: `/run/secrets/sentinel-${KID}.pem`,
     ...(valkey ? { valkeyUrl: valkey.url } : {}),
     ...(sandbox ? { sandboxBaseUrl: sandbox.url, sandboxSigningPubkey: sandbox.signingPubkey } : {}),
@@ -354,8 +360,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
 
   let worker: Stack["worker"] = null;
   let bus: Bus | null = null;
-  if (o.worker && nats) {
-    bus = await connectBus({ url: nats.url, name: "sentinel-test-publisher" });
+  const newWorker = async (over: WorkerDeps) => {
     const w = await createWorker(config, {
       ...deps,
       database: createDb<DB>({ url: appUrl, applicationName: "sentinel-worker-test" }),
@@ -366,10 +371,14 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
       }),
       cache: attestationCache(config.valkeyUrl),
       tickMs: 50,
-      ...(typeof o.worker === "object" ? o.worker : {}),
+      ...over,
     });
     await w.service.start();
-    worker = w;
+    return w;
+  };
+  if (o.worker && nats) {
+    bus = await connectBus({ url: nats.url, name: "sentinel-test-publisher" });
+    worker = await newWorker(typeof o.worker === "object" ? o.worker : {});
   }
   const account = newId("acct");
   const apiUrl = `http://127.0.0.1:${port}`;
@@ -398,6 +407,18 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
       } finally {
         await su.close();
       }
+    },
+    async resetKillSwitchLog() {
+      const su = createDb<Record<string, never>>({ url: adminUrl });
+      try {
+        await sql`truncate kill_switch_log`.execute(su.db);
+      } finally {
+        await su.close();
+      }
+    },
+    async startWorker(over = {}) {
+      if (!nats) throw new Error("no NATS (start the stack with a worker)");
+      return newWorker(over);
     },
     async destination(d) {
       const id = d.id ?? uuidv7();
