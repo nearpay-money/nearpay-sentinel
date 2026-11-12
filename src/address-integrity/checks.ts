@@ -43,7 +43,20 @@ export interface CheckFailure {
   readonly recipientUnknown?: true;
   /** `security` only: the registry row the recipient matched (R5 passed), i.e. whose account the quote pays. */
   readonly row?: RegistryRow;
+  /**
+   * `unavailable` only (SENTINEL-1, ADR-0028 amendment 2026-11-12): the provider signature (R2) is the only
+   * failure and every other check passed — referral is NearPay's, the deposit address and memo are the ones the
+   * ticket binds, the address lives until refunds begin, the fees pay the treasury and the recipient is exactly
+   * one active NearPay destination. A bad signature then cannot redirect funds; it means the provider's echo
+   * cannot be verified (format drift, like the omitted `quoteWaitingTimeMs`). Refused, recorded, paged
+   * (`ALERT integrity_drift_suspected`), never contained.
+   */
+  readonly drift?: "R2";
 }
+
+/** The reason recorded for an R2-only failure (every other check passed). */
+export const R2_DRIFT_REASON =
+  "R2 provider signature does not verify while every other check passes (provider echo drift suspected)";
 
 /**
  * An ISO 8601 instant with an explicit offset (`Z` or `±hh:mm` / `±hhmm`), any number (1–9) of fraction
@@ -230,8 +243,10 @@ type RouteOutcome = { ok: true; row: RegistryRow } | ({ ok: false } & CheckFailu
  * R2–R7 on a provider status response (R1 — the lookup itself — happens before). Values are compared as what
  * they mean (instants, integers, memo absence, the chain's address normal form), never as strings, so a
  * provider changing its formatting cannot look like tampering. A provider value sentinel cannot read, or a
- * missing NearPay configuration, is `unavailable` (refused, retried, paged), not `security`. Precedence:
- * pipeline security > request security > unavailable > R5 stale/ambiguous > R7.
+ * missing NearPay configuration, is `unavailable` (refused, retried, paged), not `security`. A signature that
+ * does not verify while every other check passes is `unavailable` with `drift: "R2"` (SENTINEL-1): R2 together
+ * with any other failure — pipeline, request, an unreadable value, a missing treasury, an R5 miss — stays a
+ * `security` breach. Precedence: pipeline security > request security > unavailable > R5 stale/ambiguous > R7.
  */
 export function checkRouteQuote(i: RouteQuoteInput): RouteOutcome {
   const q = i.status.quoteResponse;
@@ -280,6 +295,10 @@ export function checkRouteQuote(i: RouteQuoteInput): RouteOutcome {
   });
   const unknown = !match.ok && match.class === "security";
   if (unknown && !i.recipientUnknownAs) pipeline.push(`R5 ${match.reason}`);
+  // R2 alone, with every other rule verified and passing: the funds go where NearPay's own configuration and
+  // identity's registry say, so this is "cannot verify the provider's echo", not tampering (SENTINEL-1)
+  if (pipeline.length === 1 && !i.signatureValid && request.length === 0 && unavailable.length === 0 && match.ok)
+    return { ok: false, class: "unavailable", reasons: [R2_DRIFT_REASON], drift: "R2" };
   if (pipeline.length) {
     const onlyR5 = unknown && pipeline.length === 1;
     return {

@@ -32,6 +32,7 @@ import {
 } from "@nearpay-internal/db";
 import { createService, type Service } from "@nearpay-internal/service";
 import { STREAMS, type Subject } from "@nearpay-internal/spec";
+import { feeConfigHash } from "../address-integrity/config-hash.js";
 import { clientIpRule } from "../api/client-ip.js";
 import { type KeyInfo, sentinelRoutes } from "../api/routes.js";
 import { ed25519PublicKey, loadSigningKey } from "../co-signer/crypto.js";
@@ -56,11 +57,13 @@ import {
   type SolanaReader,
   solanaReader,
 } from "../infra/clients/chains.js";
+import { jwtExpiry } from "../infra/clients/oneclick-auth.js";
 import { oneClickStatus, type SandboxStatus, type StatusProvider, sandboxStatus } from "../infra/clients/providers.js";
 import { railsClient } from "../infra/clients/rails.js";
 import { oneClickTokens, sandboxTokenRegistry, type TokenRegistry } from "../infra/clients/tokens.js";
 import { MIGRATIONS_DIR } from "../infra/db/migrations.js";
 import type { DB, RegistryDB } from "../infra/db/schema.js";
+import { dbTokenListStore } from "../infra/db/token-store.js";
 import { quarantinesActive, systemicWindow } from "../kill-switch/containment.js";
 import { killSwitchState } from "../kill-switch/kill-switch.js";
 import { jobHandlers, RECURRING } from "../workers/jobs.js";
@@ -70,6 +73,7 @@ import {
   noMetrics,
   type RailsClient,
   type Sentinel,
+  type StaticGauges,
   sentinelMetrics,
 } from "./context.js";
 import { logSingleOperatorPolicy, registerSingleOperatorCounter } from "./single-operator-metrics.js";
@@ -85,6 +89,20 @@ function logContainmentPolicy(log: Service["log"], p: Sentinel["containment"]): 
     },
     "integrity containment: a breach quarantines one account; the global switch engages only on corroborated breaches across accounts",
   );
+}
+
+/** Boot lines: the fee-config fingerprint (compare with rails) and the 1Click key expiry when it is a JWT. */
+function logStatics(log: Service["log"], st: StaticGauges, nowMs: number): void {
+  log.info({ fee_config_hash: st.feeConfigHash }, "fee configuration fingerprint (rails must show the same)");
+  const exp = st.oneClickKeyExpiry?.live ?? null;
+  if (exp === null) return;
+  const days = (exp * 1000 - nowMs) / 86_400_000;
+  if (days < 7)
+    log.error(
+      { alert: "oneclick_key_expiring", expires_at: new Date(exp * 1000).toISOString() },
+      `ALERT sentinel's 1Click key expires in ${Math.max(0, Math.floor(days))} day(s): payments cannot be checked after that. Put a new key in NP_ONECLICK_API_KEY_FILE`,
+    );
+  else log.info({ expires_at: new Date(exp * 1000).toISOString() }, "1Click key expiry");
 }
 
 /** `GET /v1/attestations/keys` when no retirement is scheduled. */
@@ -114,20 +132,31 @@ interface Built {
   sentinel: Sentinel;
   database: Database<DB>;
   registry: Database<RegistryDB>;
+  /** Exported once at boot (fee-config fingerprint, 1Click key expiry). */
+  statics: StaticGauges;
 }
+
+/** Connection-acquire timeout of the registry pool (SENTINEL-5). */
+export const REGISTRY_CONNECT_TIMEOUT_MS = 1_000;
 
 function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
   const f = deps.fetch ? { fetch: deps.fetch } : {};
   const database = deps.database ?? createDb<DB>({ url: config.dbUrl, applicationName: `sentinel-${app}` });
-  // read-only role on identity's registry view, 300 ms (§9)
+  // read-only role on identity's registry view, 300 ms statements (§9); 8 connections and a 1 s
+  // connection-acquire timeout so concurrent checkouts never queue without bound (SENTINEL-5; kit 0.3.1's
+  // createDb has no option for it yet — KIT-5 — so the pool option is set on the pool it built)
   const registry =
     deps.registry ??
-    createDb<RegistryDB>({
-      url: config.registryDbUrl,
-      applicationName: `sentinel-${app}`,
-      max: 4,
-      statementTimeoutMs: 300,
-    });
+    (() => {
+      const r = createDb<RegistryDB>({
+        url: config.registryDbUrl,
+        applicationName: `sentinel-${app}`,
+        max: 8,
+        statementTimeoutMs: 300,
+      });
+      r.pool.options.connectionTimeoutMillis = REGISTRY_CONNECT_TIMEOUT_MS;
+      return r;
+    })();
   const serviceToken =
     deps.serviceToken ??
     (() => {
@@ -173,12 +202,22 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
     liveTokens:
       deps.liveTokens !== undefined
         ? deps.liveTokens
-        : oneClickTokens({ baseUrl: config.oneclickBaseUrl, apiKey: config.oneclickApiKey, ...f }),
+        : oneClickTokens({
+            baseUrl: config.oneclickBaseUrl,
+            apiKey: config.oneclickApiKey,
+            store: dbTokenListStore(database.db, "live"),
+            ...f,
+          }),
     testTokens:
       deps.testTokens !== undefined
         ? deps.testTokens
         : config.sandboxBaseUrl
-          ? sandboxTokenRegistry({ baseUrl: config.sandboxBaseUrl, serviceToken, ...f })
+          ? sandboxTokenRegistry({
+              baseUrl: config.sandboxBaseUrl,
+              serviceToken,
+              store: dbTokenListStore(database.db, "test"),
+              ...f,
+            })
           : null,
     rails: deps.rails ?? railsClient({ baseUrl: config.railsUrl, serviceToken, ...f }),
     cache: deps.cache ?? attestationCache(config.valkeyUrl),
@@ -215,7 +254,11 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
     random: deps.random ?? Math.random,
     now: deps.now ?? Date.now,
   };
-  return { sentinel, database, registry };
+  const statics: StaticGauges = {
+    feeConfigHash: feeConfigHash(sentinel),
+    oneClickKeyExpiry: { live: jwtExpiry(config.oneclickApiKey) },
+  };
+  return { sentinel, database, registry, statics };
 }
 
 function readiness(b: Built) {
@@ -241,8 +284,10 @@ function attach(b: Built, service: Service, deps: ServiceDeps) {
       quarantinesActive: () => quarantinesActive(b.sentinel),
       systemicWindow: () => systemicWindow(b.sentinel),
     },
+    b.statics,
   );
   logContainmentPolicy(service.log, b.sentinel.containment);
+  logStatics(service.log, b.statics, b.sentinel.now());
   service.onShutdown(async () => {
     if (!deps.cache) await b.sentinel.cache.close();
     if (!deps.registry) await b.registry.close();

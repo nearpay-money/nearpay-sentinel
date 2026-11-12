@@ -5,7 +5,8 @@
  * address. A `security` failure never stops the platform by itself (ADR-0028, owner directive
  * 2026-11-12): on an address rails confirms NearPay issued it is recorded and, with pipeline evidence,
  * quarantines the account; the global switch engages only on corroborated breaches across accounts
- * (kill-switch/containment.ts). Spoofs are refused, counted and rate-limited.
+ * (kill-switch/containment.ts). Spoofs are refused, counted and rate-limited per IP; request-evidence refusals
+ * per attempt (SENTINEL-6). An R2-only failure is `unavailable` drift (SENTINEL-1), never a breach.
  */
 
 import { sql } from "@nearpay-internal/db";
@@ -31,23 +32,29 @@ import { signAttestation, verifyTicket } from "./crypto.js";
 
 export type AttestBody = RouteBodyOut<typeof createDepositInstructionsAttestation>;
 
-/** Spoof refusals per client IP: 5 in 10 minutes, then 429 for the rest of the window. */
-const SPOOF_LIMIT = 5;
-const SPOOF_WINDOW_MS = 10 * 60_000;
-const spoofs = new Map<string, number[]>();
+/**
+ * Refusal limits (SENTINEL-6): 5 in 10 minutes, then 429 for the rest of the window. Spoofs (an address rails
+ * never issued) count per client IP; request-evidence refusals (fields only the caller supplied) count per
+ * attempt — never per IP, so payers behind one shared NAT (venue Wi-Fi, carrier CGNAT) are never locked out
+ * by a checkout/sentinel disagreement on another payer's attempt.
+ */
+const REFUSAL_LIMIT = 5;
+const REFUSAL_WINDOW_MS = 10 * 60_000;
+const spoofsByIp = new Map<string, number[]>();
+const requestRefusalsByAttempt = new Map<string, number[]>();
 
-function spoofed(ip: string, now: number): number {
-  const recent = (spoofs.get(ip) ?? []).filter((t) => now - t < SPOOF_WINDOW_MS);
+function counted(map: Map<string, number[]>, key: string, now: number): number {
+  const recent = (map.get(key) ?? []).filter((t) => now - t < REFUSAL_WINDOW_MS);
   recent.push(now);
-  spoofs.set(ip, recent);
-  if (spoofs.size > 10_000) spoofs.delete(spoofs.keys().next().value as string);
+  map.set(key, recent);
+  if (map.size > 10_000) map.delete(map.keys().next().value as string);
   return recent.length;
 }
 
-function limited(ip: string, now: number): number | null {
-  const recent = (spoofs.get(ip) ?? []).filter((t) => now - t < SPOOF_WINDOW_MS);
-  if (recent.length < SPOOF_LIMIT) return null;
-  return Math.ceil(((recent[0] as number) + SPOOF_WINDOW_MS - now) / 1000);
+function limitedBy(map: Map<string, number[]>, key: string, now: number): number | null {
+  const recent = (map.get(key) ?? []).filter((t) => now - t < REFUSAL_WINDOW_MS);
+  if (recent.length < REFUSAL_LIMIT) return null;
+  return Math.ceil(((recent[0] as number) + REFUSAL_WINDOW_MS - now) / 1000);
 }
 
 /** identity's registry view could not be read (§9: read-only role, 300 ms): the request is unavailable. */
@@ -55,10 +62,35 @@ class RegistryUnavailable extends Error {
   override readonly name = "RegistryUnavailable";
 }
 
+/** Total time a registry read may take with its one retry (SENTINEL-5). */
+export const REGISTRY_BUDGET_MS = 1_000;
+
+/** A statement timeout (57014) or a pool/connect timeout: worth one retry; anything else is not. */
+export function transientRegistryError(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (code === "57014") return true;
+  const msg = e instanceof Error ? e.message : String(e);
+  return /timeout exceeded when trying to connect|statement timeout|canceling statement due to|Connection terminated due to connection timeout/i.test(
+    msg,
+  );
+}
+
+/**
+ * A registry read with one retry on a transient timeout while the 1 s budget lasts (SENTINEL-5: a deploy's
+ * `migrate-identity` lock or a cold database after a wake must not refuse every payer).
+ */
 async function fromRegistry<T>(q: () => Promise<T>): Promise<T> {
+  const started = performance.now();
   try {
     return await q();
   } catch (e) {
+    if (transientRegistryError(e) && performance.now() - started < REGISTRY_BUDGET_MS) {
+      try {
+        return await q();
+      } catch (again) {
+        throw new RegistryUnavailable(again instanceof Error ? again.message : String(again));
+      }
+    }
     throw new RegistryUnavailable(e instanceof Error ? e.message : String(e));
   }
 }
@@ -150,7 +182,7 @@ export async function attest(s: Sentinel, b: AttestBody, ip: string): Promise<Si
   const started = s.now();
   const done = (result: string, reason: string) =>
     s.metrics.attestation(b.kind, result, reason, (s.now() - started) / 1000);
-  const retry = limited(ip, s.now());
+  const retry = limitedBy(spoofsByIp, ip, s.now()) ?? limitedBy(requestRefusalsByAttempt, b.attempt_id, s.now());
   if (retry !== null) {
     done("rejected", "rate_limited");
     throw new ApiError("rate_limited", { params: { retry_after: retry }, headers: { "Retry-After": String(retry) } });
@@ -265,11 +297,29 @@ async function checked(
     if (outcome.class === "unavailable") {
       // NearPay's configuration or a provider value sentinel cannot read: refuse, retry, page — never security
       await record(s, b, depositKey, { result: "unavailable", cls: "unavailable", reasons: outcome.reasons, ip });
-      done("unavailable", "checks");
-      s.log.error(
-        { reasons: outcome.reasons, livemode: b.livemode, attempt: b.attempt_id },
-        "ALERT attestation unavailable: configuration or provider response cannot be verified",
-      );
+      if (outcome.drift) {
+        // R2 alone with every other check passing (SENTINEL-1): the provider's echo cannot be verified
+        done("unavailable", "integrity_drift");
+        s.metrics.integrityDrift("r2_only", "R2");
+        s.log.error(
+          {
+            alert: "integrity_drift_suspected",
+            rule: "R2",
+            reasons: outcome.reasons,
+            livemode: b.livemode,
+            attempt: b.attempt_id,
+            deposit: b.deposit?.address,
+            hint: "1Click's status echo no longer verifies against its signature while every field matches: likely a provider format change (compare the echo with the quote request rails sent); the payment is refused, nobody is quarantined",
+          },
+          "ALERT integrity_drift_suspected: a payment was refused because the provider's signature no longer checks out, although everything else about it is right. This looks like a provider format change, not tampering",
+        );
+      } else {
+        done("unavailable", "checks");
+        s.log.error(
+          { alert: "attestation_unavailable", reasons: outcome.reasons, livemode: b.livemode, attempt: b.attempt_id },
+          "ALERT attestation unavailable: a payment was refused because NearPay's configuration or the provider's answer could not be checked",
+        );
+      }
       throw new ApiError("attestation_unavailable");
     }
     await record(s, b, depositKey, {
@@ -420,7 +470,8 @@ async function onSecurity(
   if (b.kind !== "route_quote" || !b.deposit) {
     count("unchecked");
     s.log.warn({ reasons, ip, attempt: b.attempt_id }, "intents requirement refused (security)");
-    spoofed(ip, s.now());
+    // every requirement field is caller-supplied (request evidence): counted per attempt, never per IP
+    counted(requestRefusalsByAttempt, b.attempt_id, s.now());
     return;
   }
   const known = await lookup();
@@ -428,18 +479,18 @@ async function onSecurity(
     count("unverified");
     s.log.error(
       { reasons, deposit: b.deposit.address },
-      "ALERT attestation refused (security) and rails is unreachable",
+      "ALERT a payment was refused by a security check and rails could not be asked whether NearPay issued its deposit address",
     );
     return;
   }
   if (!known.exists) {
     count("spoof");
-    const n = spoofed(ip, s.now());
+    const n = counted(spoofsByIp, ip, s.now());
     s.log.warn({ reasons, ip, deposit: b.deposit.address, count: n }, "spoofed deposit instructions refused");
     return;
   }
   count("genuine");
-  if (evidence === "request") spoofed(ip, s.now());
+  if (evidence === "request") counted(requestRefusalsByAttempt, b.attempt_id, s.now());
   // the refusal stands whatever happens here; a recording failure pages instead of failing the request
   await containBreach(s, {
     livemode: b.livemode,
@@ -454,12 +505,13 @@ async function onSecurity(
   }).catch((e) =>
     s.log.error(
       { err: e, reasons, deposit: b.deposit?.address },
-      "ALERT quote integrity breach on a NearPay deposit address could not be recorded or contained",
+      "ALERT a refused payment could not be recorded or its merchant paused (the payment stays refused)",
     ),
   );
 }
 
-/** For tests: forget spoof counters. */
+/** For tests: forget the refusal counters. */
 export function resetSpoofCounters(): void {
-  spoofs.clear();
+  spoofsByIp.clear();
+  requestRefusalsByAttempt.clear();
 }
