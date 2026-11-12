@@ -525,7 +525,7 @@ describe("SENTINEL-2: quarantines after a release, and retries", () => {
     expect((await ops("quarantine-clear-all", "x", "--test")).json).toEqual({ livemode: false, cleared: [], kept: [] });
   });
 
-  it("kill-switch-release-status: a stale single-breach stop (the 2026-11-11 incident) is reported as not platform evidence", async () => {
+  it("kill-switch-release-status: a stale single-breach stop (the 2026-11-11 incident) is reported as not platform evidence, released automatically", async () => {
     await sql`update kill_switch set engaged = true, actor = 'sentinel',
       reason = 'integrity breach on 0x11D2…5036: R4 deposit chain differs', updated_at = now() where id = 1`.execute(
       s.admin.db,
@@ -537,7 +537,9 @@ describe("SENTINEL-2: quarantines after a release, and retries", () => {
       summary: "Payments are paused: an automatic check refused a payment.",
     });
     expect(r.json.assessment).toMatch(/would not happen under the current rules/);
-    expect(r.json.steps[0]).toMatch(/Request release/);
+    expect(r.json.automatic_release).toMatchObject({ expected: true });
+    expect(r.json.steps[0]).toMatch(/^Nothing to do: sentinel switches payments back on by itself/);
+    expect(r.json.steps[1]).toMatch(/Request release/);
     // it informs only: nothing was released
     expect((await killSwitchState(s.sentinel)).engaged).toBe(true);
     await sql`update kill_switch set engaged = false where id = 1`.execute(s.admin.db);
