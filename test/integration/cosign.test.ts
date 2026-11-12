@@ -12,7 +12,7 @@ import type { OneClickQuoteResponse } from "@nearpay-internal/spec";
 import { routeQuoteDepositKey, SignedAttestation } from "@nearpay-money/spec";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { NO_RETIREMENT } from "../../src/app/services.js";
-import { resetSpoofCounters } from "../../src/co-signer/attest.js";
+import { attest as attestDirect, resetSpoofCounters } from "../../src/co-signer/attest.js";
 import { verifyAttestation } from "../../src/co-signer/crypto.js";
 import { killSwitchState } from "../../src/kill-switch/kill-switch.js";
 import { FAKE_TOKENS, type FakeOneClick, fakeOneClick, PROVIDER_FEE_ACCOUNT } from "../support/fakes.js";
@@ -252,6 +252,8 @@ describe("attested asset (CR-15-07)", () => {
 
   it("refuses when the token registry cannot be read and nothing is cached", async () => {
     oc.tokens = null;
+    // nothing persisted either (SENTINEL-4 keeps the last good list in the database)
+    await s.admin.db.deleteFrom("token_lists").execute();
     const fresh = await s.extraApi({}); // a new process: empty token cache
     try {
       const q = oc.quote({ request: { appFees: fees() } });
@@ -287,7 +289,9 @@ describe("R1 provider lookup", () => {
 });
 
 describe("security refusals", () => {
-  const tampered = () => oc.quote({ request: { appFees: fees() }, afterSign: (q) => (q.quote.amountOut = "1") });
+  // a quote changed after 1Click signed it: signature and referral both fail (an R2-only failure is drift, SENTINEL-1)
+  const tampered = () =>
+    oc.quote({ request: { appFees: fees() }, afterSign: (q) => (q.quoteRequest.referral = "attacker") });
 
   it("a spoof (rails never issued the address) is refused, counted and rate-limited per IP — never the kill switch", async () => {
     for (let i = 0; i < 5; i++) {
@@ -312,7 +316,7 @@ describe("security refusals", () => {
     expect(r.status).toBe(409);
     expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
     const breach = await s.admin.db.selectFrom("integrity_breaches").selectAll().executeTakeFirstOrThrow();
-    expect(breach).toMatchObject({ evidence: "pipeline", rules: ["R2"], quarantined: true, systemic: false });
+    expect(breach).toMatchObject({ evidence: "pipeline", rules: ["R2", "R3"], quarantined: true, systemic: false });
     const out = await s.admin.db
       .selectFrom("outbox")
       .selectAll()
@@ -472,5 +476,78 @@ describe("keys and the ops kill switch", () => {
       (await s.call("POST", "/internal/kill-switch", { token: wrong, body: { engaged: true, reason: "x" } })).status,
     ).toBe(403);
     expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
+  });
+});
+
+describe("resilience (2026-11-12 audit)", () => {
+  it("SENTINEL-5: a registry read that times out once and then answers still signs", async () => {
+    let failures = 1;
+    const flaky = s.sentinel.registry.withPlugin({
+      transformQuery(args) {
+        if (failures > 0) {
+          failures--;
+          throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+        }
+        return args.node;
+      },
+      async transformResult(args) {
+        return args.result;
+      },
+    });
+    const ctx = { ...s.sentinel, registry: flaky };
+    const q = oc.quote({ request: { appFees: fees() } });
+    const signed = await attestDirect(ctx, body(q) as never, "203.0.113.50");
+    expect(verifyAttestation(SignedAttestation.parse(signed), s.signingPublicRaw)).toBe(true);
+    expect(failures).toBe(0);
+    // a permanent error is not retried: unavailable
+    let calls = 0;
+    const broken = s.sentinel.registry.withPlugin({
+      transformQuery() {
+        calls++;
+        throw new Error("permission denied for view sentinel_destination_registry");
+      },
+      async transformResult(args) {
+        return args.result;
+      },
+    });
+    await expect(
+      attestDirect(
+        { ...s.sentinel, registry: broken },
+        body(oc.quote({ request: { appFees: fees() } })) as never,
+        "203.0.113.50",
+      ),
+    ).rejects.toMatchObject({
+      code: "attestation_unavailable",
+    });
+    expect(calls).toBe(1);
+  });
+
+  it("SENTINEL-4: the last good token list is persisted and serves a fresh process while 1Click /v0/tokens is down", async () => {
+    const headers = { "x-forwarded-for": "203.0.113.7, 10.0.0.1" };
+    await s.admin.db.deleteFrom("token_lists").execute();
+    // a process that reads 1Click's list persists it
+    const first = await s.extraApi({});
+    try {
+      const r = await first.call("POST", PATH, { body: body(oc.quote({ request: { appFees: fees() } })), headers });
+      expect(r.status).toBe(200);
+    } finally {
+      await first.stop();
+    }
+    const saved = await s.admin.db
+      .selectFrom("token_lists")
+      .selectAll()
+      .where("registry", "=", "live")
+      .executeTakeFirst();
+    expect(saved?.body).toEqual(expect.arrayContaining(FAKE_TOKENS));
+    // a restart while /v0/tokens is down signs from it
+    oc.tokens = null;
+    const second = await s.extraApi({});
+    try {
+      const r = await second.call("POST", PATH, { body: body(oc.quote({ request: { appFees: fees() } })), headers });
+      expect(r.status).toBe(200);
+    } finally {
+      oc.tokens = FAKE_TOKENS;
+      await second.stop();
+    }
   });
 });

@@ -7,8 +7,10 @@
  * These are the only cross-account quarantine writes (like the corroboration window, by design): each row is
  * still addressed by its own `account_id` and `livemode`.
  */
+import type { Kysely } from "@nearpay-internal/db";
 import { uuidv7 } from "@nearpay-internal/ids";
 import type { Tx } from "../app/context.js";
+import type { DB } from "../infra/db/schema.js";
 
 export const SENTINEL_ACTOR = "sentinel";
 
@@ -55,24 +57,31 @@ export interface BulkClearResult {
   readonly kept: readonly { account_id: string; livemode: boolean; by: string }[];
 }
 
-/** Clears sentinel's own quarantines in force that match (module doc). */
-export async function clearSentinelQuarantines(t: Tx, o: BulkClear): Promise<BulkClearResult> {
-  if (o.breachIds && o.breachIds.length === 0) return { cleared: [], kept: [] };
-  const now = new Date(o.nowMs);
+type Row = Awaited<ReturnType<typeof selectRows>>[number];
+
+function selectRows(t: Tx | Kysely<DB>, o: Omit<BulkClear, "actor" | "note">, lock: boolean) {
   let q = t
     .selectFrom("quarantines")
     .selectAll()
     .where("status", "=", "active")
-    .where("expires_at", ">", now)
-    .orderBy("account_id")
-    .forUpdate();
+    .where("expires_at", ">", new Date(o.nowMs))
+    .orderBy("account_id");
   if (o.since) q = q.where("created_at", ">=", o.since);
   if (o.breachIds) q = q.where("breach_id", "in", [...o.breachIds]);
   if (o.livemode !== undefined) q = q.where("livemode", "=", o.livemode);
-  const rows = await q.execute();
-  const cleared: { account_id: string; livemode: boolean }[] = [];
+  return (lock ? q.forUpdate() : q).execute();
+}
+
+/** Which quarantines in force a bulk clear would lift, and which it keeps (no writes). */
+export async function bulkClearPlan(
+  t: Tx | Kysely<DB>,
+  o: Omit<BulkClear, "actor" | "note">,
+  lock = false,
+): Promise<{ clear: Row[]; kept: BulkClearResult["kept"] }> {
+  if (o.breachIds && o.breachIds.length === 0) return { clear: [], kept: [] };
+  const clear: Row[] = [];
   const kept: { account_id: string; livemode: boolean; by: string }[] = [];
-  for (const r of rows) {
+  for (const r of await selectRows(t, o, lock)) {
     const last = await t
       .selectFrom("quarantine_log")
       .select("actor")
@@ -83,10 +92,18 @@ export async function clearSentinelQuarantines(t: Tx, o: BulkClear): Promise<Bul
       .limit(1)
       .executeTakeFirst();
     const by = r.created_by !== SENTINEL_ACTOR ? r.created_by : (last?.actor ?? SENTINEL_ACTOR);
-    if (by !== SENTINEL_ACTOR) {
-      kept.push({ account_id: r.account_id, livemode: r.livemode, by });
-      continue;
-    }
+    if (by === SENTINEL_ACTOR) clear.push(r);
+    else kept.push({ account_id: r.account_id, livemode: r.livemode, by });
+  }
+  return { clear, kept };
+}
+
+/** Clears sentinel's own quarantines in force that match (module doc). */
+export async function clearSentinelQuarantines(t: Tx, o: BulkClear): Promise<BulkClearResult> {
+  const now = new Date(o.nowMs);
+  const plan = await bulkClearPlan(t, o, true);
+  const cleared: { account_id: string; livemode: boolean }[] = [];
+  for (const r of plan.clear) {
     const version = r.version + 1;
     await t
       .updateTable("quarantines")
@@ -104,5 +121,5 @@ export async function clearSentinelQuarantines(t: Tx, o: BulkClear): Promise<Bul
     await quarantineLog(t, r.account_id, r.livemode, "cleared", o.note, o.actor, null, version);
     cleared.push({ account_id: r.account_id, livemode: r.livemode });
   }
-  return { cleared, kept };
+  return { cleared, kept: plan.kept };
 }

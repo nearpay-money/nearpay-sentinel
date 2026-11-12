@@ -14,6 +14,7 @@ import {
 import type { Sentinel } from "../app/context.js";
 import { windowBreaches } from "../kill-switch/containment.js";
 import { killSwitchState, plainReason } from "../kill-switch/kill-switch.js";
+import { bulkClearPlan } from "../kill-switch/quarantine-clear.js";
 import {
   DEFAULT_SINGLE_OPERATOR_POLICY,
   RELEASE_TTL_MS,
@@ -41,14 +42,7 @@ export async function releaseStatus(s: Pick<Sentinel, "db" | "now" | "containmen
   const verdict = staleAutomaticStop({ actor: st.actor, reason: st.reason, atMs: engagedAt }, breaches, s.containment);
 
   const since = new Date(engagementQuarantineSince({ actor: st.actor, atMs: engagedAt }, s.containment));
-  const paused = await s.db
-    .selectFrom("quarantines")
-    .select((eb) => eb.fn.countAll<string>().as("n"))
-    .where("status", "=", "active")
-    .where("expires_at", ">", new Date(now))
-    .where("created_by", "=", "sentinel")
-    .where("created_at", ">=", since)
-    .executeTakeFirstOrThrow();
+  const plan = await bulkClearPlan(s.db, { since, nowMs: now });
 
   const p = await s.db.selectFrom("release_requests").selectAll().where("status", "=", "pending").executeTakeFirst();
   const pendingValid = p && p.switch_version === st.version && p.expires_at.getTime() > now ? p : null;
@@ -94,7 +88,8 @@ export async function releaseStatus(s: Pick<Sentinel, "db" | "now" | "containmen
         }
       : null,
     request_lifetime_min: RELEASE_TTL_MS / 60_000,
-    merchants_switched_back_on_by_release: Number(paused.n),
+    merchants_switched_back_on_by_release: plan.clear.length,
+    merchants_kept_paused_by_operators: plan.kept.length,
     steps,
   };
 }
