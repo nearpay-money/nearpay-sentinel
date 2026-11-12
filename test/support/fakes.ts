@@ -91,8 +91,20 @@ export interface FakeOneClick extends FakeServer {
   tokens: unknown[] | null;
 }
 
-/** USDC on Base (the recorded quote's origin asset) and USDC on NEAR (its destination). */
+/**
+ * USDC on Base (the recorded quote's origin asset), USDC on NEAR (its destination), and USDT on BNB Smart Chain under
+ * the 2026-11 `omdep` bridge id (live list entry: prefix `bnb`, blockchain `bsc`, 18 decimals).
+ */
 export const FAKE_TOKENS = [
+  {
+    assetId: "nep141:bnb-0x55d398326f99059ff775485246999027b3197955.omdep.near",
+    decimals: 18,
+    blockchain: "bsc",
+    symbol: "USDT",
+    price: 1,
+    priceUpdatedAt: "2026-11-12T00:00:00.000Z",
+    contractAddress: "0x55d398326f99059ff775485246999027b3197955",
+  },
   {
     assetId: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near",
     decimals: 6,

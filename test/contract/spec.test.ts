@@ -74,7 +74,7 @@ describe("provider wire schemas", () => {
 
 describe("spec 0.4.0 (Stage 4 chains, lld/sentinel.md §16)", () => {
   it("is built against spec 0.4.0; Stage 4 adds no sentinel route", () => {
-    expect(SPEC_VERSION).toBe("0.5.0"); // public package renamed to @nearpay-money/spec (0.5.0 = 0.4.2 contracts)
+    expect(SPEC_VERSION).toBe("0.5.2"); // @nearpay-money/spec 0.5.2: asset id shapes (omdep, 1cs_v1), parseAssetId
     expect(SPEC_INTERNAL_VERSION).toBe("0.4.0");
     expect(ALL.filter((r) => r.service === "sentinel" && r.stage > 2).map((r) => r.id)).toEqual([]);
   });

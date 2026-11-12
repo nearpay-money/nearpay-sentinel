@@ -3,6 +3,7 @@
  * from the id alone — never from a registry another service controls.
  */
 import { chainByBlockchain } from "@nearpay-internal/chains";
+import { parseAssetId } from "@nearpay-money/spec";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import bs58 from "bs58";
 
@@ -10,12 +11,16 @@ import bs58 from "bs58";
 export const NEAR = "near:mainnet";
 
 /**
- * What a NEAR Intents asset id says about its token, independently of any registry (PoA bridge,
- * `omft.near`): `nep141:<prefix>-0x<20 bytes>.omft.near` → an ERC-20 on that EVM chain;
- * `nep141:<prefix>.omft.near` → the chain's native asset; `nep141:sol-<40 hex>.omft.near` → a Solana SPL
- * token whose mint hashes to that value (Stage 4, {@link splAssetHash}); `nep141:<prefix>-<token>.omft.near`
- * → another bridged token of that chain; `nep141:<account>` → a NEP-141 token on NEAR; anything else (other
- * bridges, NEP-245 ids) → `other`. `chain` is null when the bridge prefix is not a known chain.
+ * What a NEAR Intents asset id says about its token, independently of any registry. The id shapes are parsed by
+ * spec `parseAssetId` (0.5.2), shared by every service: PoA bridge ids with either suffix
+ * (`nep141:<prefix>[-<token>].omft.near` and, since 2026-11, `.omdep.near`; prefix aliases such as `bnb` → BSC),
+ * `1cs_v1:<chain>:<standard>:<address>`, and NEAR NEP-141 accounts. `<prefix>-0x<20 bytes>` → an ERC-20 on that
+ * EVM chain; no token → the chain's native asset; a Solana hash20 (`sol-<40 hex>` / `sol-0x<40 hex>`) → an SPL
+ * token whose mint hashes to it ({@link splAssetHash}); another token shape → `bridged`; `1cs_v1` ERC-20/BEP-20 →
+ * `erc20`, NEP-141 → `nep141`, `native` → native, others → `bridged`; `nep141:<account>` → a NEP-141 token on NEAR;
+ * anything else — `nep245:` ids and NEP-141 accounts that only look bridged (spec safety rule) → `other`, never
+ * NEAR. `chain` is null when the chain is not one kit `chains` knows (incident 2026-11-11: an omdep BSC token
+ * read as NEAR refused a genuine deposit with "R4 deposit chain differs").
  */
 export type AssetShape =
   | { readonly kind: "erc20"; readonly chain: string; readonly contract: string }
@@ -25,22 +30,37 @@ export type AssetShape =
   | { readonly kind: "nep141"; readonly contract: string }
   | { readonly kind: "other" };
 
+const EVM_TOKEN = /^0x[0-9a-f]{40}$/;
+
 export function assetShape(assetId: string): AssetShape {
-  const omft = /^nep141:([a-z0-9]+)(?:-([0-9a-z]+))?\.omft\.near$/.exec(assetId);
-  if (omft) {
-    const info = chainByBlockchain(omft[1] as string);
-    const chain = info?.caip2 ?? null;
-    const token = omft[2];
-    if (token === undefined) return { kind: "native", chain };
-    if (info?.family === "evm" && /^0x[0-9a-f]{40}$/.test(token))
-      return { kind: "erc20", chain: info.caip2, contract: token };
-    if (info?.family === "solana" && /^[0-9a-f]{40}$/.test(token))
-      return { kind: "spl", chain: info.caip2, hash20: token };
-    return { kind: "bridged", chain };
+  const a = parseAssetId(assetId);
+  switch (a.scheme) {
+    case "omft":
+    case "omdep": {
+      const info = chainByBlockchain(a.blockchain);
+      const chain = info?.caip2 ?? null;
+      if (a.kind === "native") return { kind: "native", chain };
+      if (a.kind === "evm" && info?.family === "evm")
+        return { kind: "erc20", chain: info.caip2, contract: a.token as string };
+      if (a.kind === "hash20" && info?.family === "solana")
+        return { kind: "spl", chain: info.caip2, hash20: a.token as string };
+      return { kind: "bridged", chain };
+    }
+    case "1cs_v1": {
+      const info = chainByBlockchain(a.blockchain);
+      if (!info) return { kind: "bridged", chain: null };
+      if (a.standard === "native") return { kind: "native", chain: info.caip2 };
+      const address = a.address.toLowerCase();
+      if (info.family === "evm" && (a.standard === "erc20" || a.standard === "bep20") && EVM_TOKEN.test(address))
+        return { kind: "erc20", chain: info.caip2, contract: address };
+      if (info.family === "near" && a.standard === "nep141") return { kind: "nep141", contract: a.address };
+      return { kind: "bridged", chain: info.caip2 };
+    }
+    case "nep141":
+      return { kind: "nep141", contract: a.account };
+    default:
+      return { kind: "other" };
   }
-  const nep141 = /^nep141:([a-z0-9][a-z0-9._-]*)$/.exec(assetId);
-  if (nep141) return { kind: "nep141", contract: nep141[1] as string };
-  return { kind: "other" };
 }
 
 /**

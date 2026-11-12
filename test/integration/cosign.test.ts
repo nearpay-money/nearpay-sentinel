@@ -134,6 +134,29 @@ describe("signing", () => {
     expect((await rows(fb.attempt_id))[0]).toMatchObject({ client_ip: "203.0.113.8" });
   });
 
+  it("signs an omdep origin asset on BNB Smart Chain (the 2026-11-11 incident quote shape): no breach, no switch", async () => {
+    const USDT_BSC = "nep141:bnb-0x55d398326f99059ff775485246999027b3197955.omdep.near";
+    const q = oc.quote({
+      request: { appFees: fees(), originAsset: USDT_BSC },
+      quote: { amountIn: "2014321000000000000", amountInFormatted: "2.014321" },
+    });
+    s.issued.set(q.quote.depositAddress as string, { livemode: true, account_id: s.account });
+    const b = body(q, { deposit: { chain: "eip155:56", origin_asset_id: USDT_BSC } });
+    const r = await attest(b);
+    expect(r.status).toBe(200);
+    expect(SignedAttestation.parse(r.body).attestation).toMatchObject({
+      deposit: { chain: "eip155:56", origin_asset_id: USDT_BSC },
+      asset: {
+        asset_id: USDT_BSC,
+        symbol: "USDT",
+        decimals: 18,
+        token: { standard: "erc20", address: "0x55d398326f99059ff775485246999027b3197955" },
+      },
+    });
+    expect(await s.admin.db.selectFrom("integrity_breaches").selectAll().execute()).toEqual([]);
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
+  });
+
   it("re-serves the cached attestation without asking the provider again (idempotent retries)", async () => {
     const q = oc.quote({ request: { appFees: fees() } });
     const b = body(q);
