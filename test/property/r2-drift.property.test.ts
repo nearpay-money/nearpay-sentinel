@@ -49,7 +49,9 @@ const flags = fc.record({
   rereadAs: fc.constantFrom(undefined, "stale", "unavailable"),
 });
 
-function build(f: fc.Infer<typeof flags>): RouteQuoteInput {
+type Flags = typeof flags extends fc.Arbitrary<infer T> ? T : never;
+
+function build(f: Flags): RouteQuoteInput {
   const q = fixture<OneClickQuoteResponse>("oneclick/dry-quote.json");
   q.quoteRequest.dry = false;
   q.quote.depositAddress = f.address ? DEPOSIT : `0x${"b".repeat(40)}`;
