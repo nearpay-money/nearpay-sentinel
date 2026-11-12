@@ -5,6 +5,7 @@ import type { Kysely, Transaction } from "@nearpay-internal/db";
 import type { Logger, ServiceMetrics } from "@nearpay-internal/service";
 import { Redis } from "ioredis";
 import type { ProviderSplit } from "../address-integrity/checks.js";
+import type { ContainmentPolicy } from "../address-integrity/containment.js";
 import type { ClientIpRule } from "../api/client-ip.js";
 import type { SigningKey } from "../co-signer/crypto.js";
 import type { EsploraReader, EvmReader, NearReader, SolanaReader } from "../infra/clients/chains.js";
@@ -23,6 +24,19 @@ export interface SentinelMetrics {
   coverageMissing(chain: string): void;
   /** `nearpay_ops_single_operator_actions_total{action}` (app/single-operator-metrics.ts). */
   singleOperatorAction(action: string): void;
+  /**
+   * A `security` refusal (ADR-0028), once per rule: `evidence` pipeline|request, `rule` R2…R6|intents,
+   * `address` genuine (rails confirmed NearPay issued it) | spoof | unverified (rails unreachable).
+   */
+  integrityRefusal(livemode: boolean, evidence: string, rule: string, address: string): void;
+  /** The corroboration rule engaged the global kill switch. */
+  systemicEngaged(): void;
+}
+
+/** Scrape-time readers for the containment gauges (database state shared by every replica). */
+export interface ContainmentGauges {
+  quarantinesActive(): Promise<number>;
+  systemicWindow(): Promise<{ refusals: number; accounts: number }>;
 }
 
 export const noMetrics: SentinelMetrics = {
@@ -31,6 +45,8 @@ export const noMetrics: SentinelMetrics = {
   killSwitch() {},
   coverageMissing() {},
   singleOperatorAction() {},
+  integrityRefusal() {},
+  systemicEngaged() {},
 };
 
 /** Service metrics (§12). The kill-switch gauge is read from the database on every scrape. */
@@ -38,6 +54,7 @@ export function sentinelMetrics(
   m: ServiceMetrics,
   engaged?: () => Promise<boolean>,
   singleOperatorAction: (action: string) => void = () => {},
+  containment?: ContainmentGauges,
 ): SentinelMetrics {
   const att = m.counter("attestations_total", "Co-signing requests by outcome.", ["kind", "result", "reason"]);
   const dur = m.histogram(
@@ -62,7 +79,41 @@ export function sentinelMetrics(
         }
       : undefined,
   );
+  const refusals = m.counter(
+    "integrity_refusals_total",
+    "Security refusals of deposit instructions by evidence, rule and whether rails confirmed the address (ADR-0028).",
+    ["livemode", "evidence", "rule", "address"],
+  );
+  const systemic = m.counter(
+    "integrity_systemic_engaged_total",
+    "Times corroborated integrity breaches across accounts engaged the global kill switch.",
+  );
+  m.gauge(
+    "quarantines_active",
+    "Accounts whose deposit instructions sentinel does not sign right now (live and test).",
+    [],
+    containment
+      ? async (g) => {
+          g.set(await containment.quarantinesActive());
+        }
+      : undefined,
+  );
+  m.gauge(
+    "integrity_systemic_window",
+    "Pipeline breaches on genuine live addresses in the current corroboration window (refusals, distinct accounts).",
+    ["measure"],
+    containment
+      ? async (g) => {
+          const w = await containment.systemicWindow();
+          g.set({ measure: "refusals" }, w.refusals);
+          g.set({ measure: "accounts" }, w.accounts);
+        }
+      : undefined,
+  );
   return {
+    integrityRefusal: (livemode, evidence, rule, address) =>
+      refusals.inc({ livemode: String(livemode), evidence, rule, address }),
+    systemicEngaged: () => systemic.inc(),
     attestation: (kind, result, reason, s) => {
       att.inc({ kind, result, reason });
       dur.observe({ result }, s);
@@ -125,12 +176,23 @@ export function attestationCache(valkeyUrl: string | undefined, now: () => numbe
 
 /**
  * Rails' internal API with sentinel's service credentials (`rails.read`). Never a source of truth for
- * a verdict: `exists` only decides whether a security refusal engages the kill switch (§5), and `asset`
- * only feeds audit sampling (§7).
+ * a verdict: `exists` only decides whether a security refusal is contained (quarantine, corroboration —
+ * §5, ADR-0028) or counted as a spoof, and `asset` only feeds audit sampling (§7).
  */
 export interface RailsClient {
-  /** Did NearPay issue this deposit address? null = rails unreachable. */
-  exists(address: string, memo: string | null): Promise<{ exists: boolean; livemode: boolean | null } | null>;
+  /**
+   * Did NearPay issue this deposit address? null = rails unreachable. The execution and account only scope a
+   * quarantine and an audit finding (ADR-0028); they never decide a verdict.
+   */
+  exists(
+    address: string,
+    memo: string | null,
+  ): Promise<{
+    exists: boolean;
+    livemode: boolean | null;
+    execution_id?: string | null;
+    account_id?: string | null;
+  } | null>;
   /** Decimals and USD price of an asset; null when rails does not know it or is unreachable. */
   asset(assetId: string, livemode: boolean): Promise<{ decimals: number; price_usd: string | null } | null>;
 }
@@ -166,6 +228,8 @@ export interface Sentinel {
   readonly auditAlwaysUsdMicros: bigint;
   /** Adaptive two-person rule: wait before a single operator completes their own request (`NP_OPS_SINGLE_OPERATOR_DELAY_S`). */
   readonly singleOperator: SingleOperatorPolicy;
+  /** Integrity containment: quarantine TTL, corroboration thresholds, R5 re-read (ADR-0028). */
+  readonly containment: ContainmentPolicy;
   readonly random: () => number;
   readonly now: () => number;
 }

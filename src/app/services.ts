@@ -38,6 +38,7 @@ import { ed25519PublicKey, loadSigningKey } from "../co-signer/crypto.js";
 import {
   type ApiConfig,
   bitcoinEsploraUrls,
+  containmentPolicy,
   evmRpcUrls,
   nearRpcUrls,
   type SharedConfig,
@@ -60,6 +61,7 @@ import { railsClient } from "../infra/clients/rails.js";
 import { oneClickTokens, sandboxTokenRegistry, type TokenRegistry } from "../infra/clients/tokens.js";
 import { MIGRATIONS_DIR } from "../infra/db/migrations.js";
 import type { DB, RegistryDB } from "../infra/db/schema.js";
+import { quarantinesActive, systemicWindow } from "../kill-switch/containment.js";
 import { killSwitchState } from "../kill-switch/kill-switch.js";
 import { jobHandlers, RECURRING } from "../workers/jobs.js";
 import {
@@ -71,6 +73,19 @@ import {
   sentinelMetrics,
 } from "./context.js";
 import { logSingleOperatorPolicy, registerSingleOperatorCounter } from "./single-operator-metrics.js";
+
+/** Boot line: how integrity refusals are contained (ADR-0028). */
+function logContainmentPolicy(log: Service["log"], p: Sentinel["containment"]): void {
+  log.info(
+    {
+      quarantine_ttl_s: p.quarantineTtlMs / 1000,
+      systemic_refusals: p.systemicRefusals,
+      systemic_accounts: p.systemicAccounts,
+      systemic_window_s: p.systemicWindowMs / 1000,
+    },
+    "integrity containment: a breach quarantines one account; the global switch engages only on corroborated breaches across accounts",
+  );
+}
 
 /** `GET /v1/attestations/keys` when no retirement is scheduled. */
 export const NO_RETIREMENT = "9999-12-31T23:59:59.000Z";
@@ -196,6 +211,7 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
     auditSampleRate: config.auditSampleRate,
     auditAlwaysUsdMicros: BigInt(Math.round(config.auditAlwaysUsd * 1_000_000)),
     singleOperator: { delayMs: (config.opsSingleOperatorDelayS ?? 300) * 1000 },
+    containment: containmentPolicy(config),
     random: deps.random ?? Math.random,
     now: deps.now ?? Date.now,
   };
@@ -221,7 +237,12 @@ function attach(b: Built, service: Service, deps: ServiceDeps) {
     service.metrics,
     async () => (await killSwitchState(b.sentinel)).engaged,
     registerSingleOperatorCounter(service.metrics),
+    {
+      quarantinesActive: () => quarantinesActive(b.sentinel),
+      systemicWindow: () => systemicWindow(b.sentinel),
+    },
   );
+  logContainmentPolicy(service.log, b.sentinel.containment);
   service.onShutdown(async () => {
     if (!deps.cache) await b.sentinel.cache.close();
     if (!deps.registry) await b.registry.close();

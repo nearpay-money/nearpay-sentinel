@@ -45,6 +45,7 @@ afterAll(async () => {
 beforeEach(async () => {
   resetSpoofCounters();
   s.issued.clear();
+  await s.resetContainment();
   if ((await killSwitchState(s.sentinel)).engaged)
     await sql`update kill_switch set engaged = false where id = 1`.execute(s.admin.db);
 });
@@ -131,6 +132,29 @@ describe("signing", () => {
     });
     expect(forged.status).toBe(200);
     expect((await rows(fb.attempt_id))[0]).toMatchObject({ client_ip: "203.0.113.8" });
+  });
+
+  it("signs an omdep origin asset on BNB Smart Chain (the 2026-11-11 incident quote shape): no breach, no switch", async () => {
+    const USDT_BSC = "nep141:bnb-0x55d398326f99059ff775485246999027b3197955.omdep.near";
+    const q = oc.quote({
+      request: { appFees: fees(), originAsset: USDT_BSC },
+      quote: { amountIn: "2014321000000000000", amountInFormatted: "2.014321" },
+    });
+    s.issued.set(q.quote.depositAddress as string, { livemode: true, account_id: s.account });
+    const b = body(q, { deposit: { chain: "eip155:56", origin_asset_id: USDT_BSC } });
+    const r = await attest(b);
+    expect(r.status).toBe(200);
+    expect(SignedAttestation.parse(r.body).attestation).toMatchObject({
+      deposit: { chain: "eip155:56", origin_asset_id: USDT_BSC },
+      asset: {
+        asset_id: USDT_BSC,
+        symbol: "USDT",
+        decimals: 18,
+        token: { standard: "erc20", address: "0x55d398326f99059ff775485246999027b3197955" },
+      },
+    });
+    expect(await s.admin.db.selectFrom("integrity_breaches").selectAll().execute()).toEqual([]);
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
   });
 
   it("re-serves the cached attestation without asking the provider again (idempotent retries)", async () => {
@@ -280,26 +304,25 @@ describe("security refusals", () => {
     expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
   });
 
-  it("a breach on a live address rails confirms engages the kill switch and emits engaged (outbox)", async () => {
+  it("a breach on a live address rails confirms is contained: refused, recorded, account quarantined — never the global switch (ADR-0028)", async () => {
     const q = tampered();
-    s.issued.set(q.quote.depositAddress as string, { livemode: true });
+    s.issued.set(q.quote.depositAddress as string, { livemode: true, account_id: s.account });
     const b = body(q);
     const r = await attest(b);
     expect(r.status).toBe(409);
-    const st = await killSwitchState(s.sentinel);
-    expect(st).toMatchObject({ engaged: true, actor: "sentinel" });
-    expect(st.reason).toContain(q.quote.depositAddress as string);
-    expect(st.reason).toContain("R2");
+    expect((await killSwitchState(s.sentinel)).engaged).toBe(false);
+    const breach = await s.admin.db.selectFrom("integrity_breaches").selectAll().executeTakeFirstOrThrow();
+    expect(breach).toMatchObject({ evidence: "pipeline", rules: ["R2"], quarantined: true, systemic: false });
     const out = await s.admin.db
       .selectFrom("outbox")
       .selectAll()
-      .where("subject", "=", "evt.sentinel.kill_switch.engaged")
+      .where("subject", "=", "evt.sentinel.audit_finding.created")
       .orderBy("created_at", "desc")
       .executeTakeFirstOrThrow();
-    expect(out.aggregate_version).toBe(st.version);
     expect((out.payload as { data: { object: unknown } }).data.object).toMatchObject({
-      engaged: true,
-      actor: "sentinel",
+      account_id: s.account,
+      check_kind: "attestation",
+      result: "mismatch",
     });
     expect((await rows(b.attempt_id))[0]).toMatchObject({ result: "rejected", class: "security" });
   });

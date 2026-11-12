@@ -17,9 +17,86 @@ import { attestedChain } from "./attested-chains.js";
 
 export type FailureClass = "security" | "ambiguous" | "stale" | "unavailable";
 
+/**
+ * What a `security` refusal is evidence of (ADR-0028):
+ * - `pipeline`: a field rails put into the quote, or the provider signed or echoed, disagrees with NearPay's
+ *   own configuration, identity's registry or the deposit sentinel asked about (R2, R3, R4 address/memo/
+ *   address lifetime/address shape, R5, R6). A payer cannot produce it: sentinel reads the quote from the
+ *   provider itself, and the ticket binds the deposit address and memo. Only this evidence quarantines an
+ *   account and counts toward the corroborated (systemic) global stop.
+ * - `request`: only fields the caller supplied (checkout, i.e. the payer's browser) disagree with the signed
+ *   quote (R4 origin asset, amount, chain, deadline; every `intents_transfer` requirement field). Anyone
+ *   holding a ticket for their own attempt can send it at will, so it is refused, recorded and counted per IP
+ *   but never stops anything beyond that request (L-SN-01).
+ */
+export type Evidence = "pipeline" | "request";
+
 export interface CheckFailure {
   readonly class: FailureClass;
   readonly reasons: readonly string[];
+  /** `security` only. */
+  readonly evidence?: Evidence;
+  /**
+   * `security` only: R5 found no destination at all for the recipient and it is the only pipeline reason —
+   * the co-signer re-reads identity's registry before it decides (stale view vs a recipient NearPay never had).
+   */
+  readonly recipientUnknown?: true;
+  /** `security` only: the registry row the recipient matched (R5 passed), i.e. whose account the quote pays. */
+  readonly row?: RegistryRow;
+}
+
+/**
+ * An ISO 8601 instant with an explicit offset (`Z` or `±hh:mm` / `±hhmm`), any number (1–9) of fraction
+ * digits, as nanoseconds since the epoch; null for anything else — including a local time without an offset,
+ * which `Date.parse` would read in the process's time zone. Comparing these values compares instants, so
+ * `…:33Z`, `…:33.000Z`, `…:33.000000Z` and `…:33+00:00` are equal and `…:33.000001Z` is not.
+ */
+export function instantNs(s: unknown): bigint | null {
+  if (typeof s !== "string") return null;
+  const m =
+    /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,9}))?(?:([Zz])|([+-])(\d{2}):?(\d{2}))$/.exec(s);
+  if (!m) return null;
+  const [y, mo, d, h, mi, se] = [m[1], m[2], m[3], m[4], m[5], m[6]].map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || se > 59) return null;
+  const ms = Date.UTC(y, mo - 1, d, h, mi, se);
+  if (new Date(ms).getUTCDate() !== d) return null; // 2026-02-30
+  let offsetMin = 0;
+  if (!m[8]) {
+    const oh = Number(m[10]);
+    const om = Number(m[11]);
+    if (oh > 23 || om > 59) return null;
+    offsetMin = (m[9] === "-" ? -1 : 1) * (oh * 60 + om);
+  }
+  const frac = BigInt((m[7] ?? "").padEnd(9, "0"));
+  return (BigInt(ms) - BigInt(offsetMin) * 60_000n) * 1_000_000n + frac;
+}
+
+/** A base-unit amount as an integer: plain decimal digits (an integral `.000…` tail allowed); null otherwise. */
+export function baseUnits(s: unknown): bigint | null {
+  if (typeof s !== "string") return null;
+  const m = /^(\d{1,78})(?:\.0+)?$/.exec(s);
+  return m ? BigInt(m[1] as string) : null;
+}
+
+/** A deposit memo: absent, null and "" all mean "no memo"; any other value is compared exactly. */
+const memoOf = (m: string | null | undefined): string | null => (m === undefined || m === null || m === "" ? null : m);
+
+/** Same deposit address: the chain's normal form when it has one (EVM and bech32 case), else exact. */
+function sameAddress(chain: string | null, a: string, b: string): boolean {
+  if (a === b) return true;
+  if (chain === null) return false;
+  try {
+    return normalizeAddress(chain, a) === normalizeAddress(chain, b);
+  } catch {
+    return false;
+  }
 }
 
 export interface ProviderSplit {
@@ -112,6 +189,22 @@ export function matchRegistry(
   return { ok: false, class: "ambiguous", reason: `${hits.length} destinations match the recipient` };
 }
 
+/**
+ * R5 re-read (ADR-0028): is `recipient` one of these registry rows' addresses, whatever its asset, type or
+ * mode? Used only to tell a stale view or a merchant's own wallet from a recipient NearPay never had.
+ */
+export function recipientIsListed(rows: readonly RegistryRow[], recipient: string): boolean {
+  return rows.some((r) => {
+    if (r.address_norm === recipient.toLowerCase()) return true;
+    if (r.type !== "chain_address") return false;
+    try {
+      return normalizeAddress(r.chain, recipient) === r.address_norm;
+    } catch {
+      return false;
+    }
+  });
+}
+
 export interface RouteQuoteInput {
   readonly livemode: boolean;
   readonly deposit: Deposit;
@@ -122,51 +215,97 @@ export interface RouteQuoteInput {
   readonly referral: string;
   readonly split: ProviderSplit;
   readonly nowMs: number;
+  /**
+   * The co-signer's verdict on a recipient R5 found nowhere in the registry, after re-reading it (ADR-0028):
+   * `stale` (identity's view may lag: the account's payout wallets changed recently, or the recipient is one
+   * of its own wallets for another asset) or `unavailable` (the view is behind or unreadable). Absent: R5's
+   * own `security`.
+   */
+  readonly recipientUnknownAs?: { readonly class: "stale" | "unavailable"; readonly reason: string };
 }
 
-/** R2–R7 on a provider status response (R1 — the lookup itself — happens before). */
-export function checkRouteQuote(i: RouteQuoteInput): { ok: true; row: RegistryRow } | ({ ok: false } & CheckFailure) {
+type RouteOutcome = { ok: true; row: RegistryRow } | ({ ok: false } & CheckFailure);
+
+/**
+ * R2–R7 on a provider status response (R1 — the lookup itself — happens before). Values are compared as what
+ * they mean (instants, integers, memo absence, the chain's address normal form), never as strings, so a
+ * provider changing its formatting cannot look like tampering. A provider value sentinel cannot read, or a
+ * missing NearPay configuration, is `unavailable` (refused, retried, paged), not `security`. Precedence:
+ * pipeline security > request security > unavailable > R5 stale/ambiguous > R7.
+ */
+export function checkRouteQuote(i: RouteQuoteInput): RouteOutcome {
   const q = i.status.quoteResponse;
-  const security: string[] = [];
-  if (!i.signatureValid) security.push("R2 provider signature does not verify");
-  if (q.quoteRequest.referral !== i.referral) security.push("R3 referral is not NearPay's");
-  if (q.quote.depositAddress !== i.deposit.address) security.push("R4 deposit address differs");
-  if ((q.quote.depositMemo ?? null) !== i.deposit.memo) security.push("R4 deposit memo differs");
-  if (q.quoteRequest.originAsset !== i.deposit.origin_asset_id) security.push("R4 origin asset differs");
-  if (q.quote.amountIn !== i.deposit.amount_in) security.push("R4 amount differs");
+  const pipeline: string[] = [];
+  const request: string[] = [];
+  const unavailable: string[] = [];
+  if (!i.signatureValid) pipeline.push("R2 provider signature does not verify");
+  if (q.quoteRequest.referral !== i.referral) pipeline.push("R3 referral is not NearPay's");
   // the chain checkout names must be the one the deposit address lives on (an EVM address is valid on
   // every EVM chain, so a wrong chain would send funds where nobody watches): Intents deposits are on
   // NEAR; otherwise the origin asset's own chain, whenever its id says so
   const depositChain = q.quoteRequest.depositType === "INTENTS" ? NEAR : assetChain(q.quoteRequest.originAsset);
-  if (depositChain !== null && i.deposit.chain !== depositChain) security.push("R4 deposit chain differs");
+  // address and memo are bound by the ticket and are what sentinel asked the provider about: a different
+  // answer comes from the provider, not from the caller
+  if (!sameAddress(depositChain, q.quote.depositAddress ?? "", i.deposit.address))
+    pipeline.push("R4 deposit address differs");
+  if (memoOf(q.quote.depositMemo) !== memoOf(i.deposit.memo)) pipeline.push("R4 deposit memo differs");
+  if (q.quoteRequest.originAsset !== i.deposit.origin_asset_id) request.push("R4 origin asset differs");
+  const signedIn = baseUnits(q.quote.amountIn);
+  if (signedIn === null) unavailable.push("R4 the provider's amountIn is not a base-unit integer");
+  else if (signedIn !== baseUnits(i.deposit.amount_in)) request.push("R4 amount differs");
+  if (depositChain !== null && i.deposit.chain !== depositChain) request.push("R4 deposit chain differs");
   // Solana / Bitcoin (§16): the provider's deposit address must also be a valid address of that chain
   if (depositChain !== null && attestedChain(depositChain)?.depositAddressShape) {
     const v = validateAddress(depositChain, q.quote.depositAddress ?? "");
-    if (!v.ok) security.push(`R4 deposit address is not a valid ${depositChain} address (${v.reason})`);
+    if (!v.ok) pipeline.push(`R4 deposit address is not a valid ${depositChain} address (${v.reason})`);
   }
   // The payer-facing deadline is when 1Click starts refunding: quoteRequest.deadline. It is NOT covered by the
   // quote signature (the SDK hashes {...request, ...quote}, so quote.deadline overwrites it); it is trusted
   // because sentinel reads it from 1Click itself over TLS (R1), never from rails or checkout. Live 1Click's
   // quote.deadline is when the deposit address goes inactive (3 days later on mainnet, 2026-11-07; the sandbox
   // sets both equal), so it must not end before refunds begin.
-  const qd = Date.parse(q.quoteRequest.deadline);
-  if (!Number.isFinite(qd) || qd !== Date.parse(i.deposit.deadline)) security.push("R4 deadline differs");
-  const inactive = q.quote.deadline ? Date.parse(q.quote.deadline) : Number.NaN;
-  if (!Number.isFinite(inactive) || inactive < qd)
-    security.push("R4 deposit address goes inactive before the deadline");
-  if (!i.treasury) security.push("R6 no treasury configured for this mode");
-  else security.push(...appFeesFailures(q.quoteRequest.appFees, i.treasury, i.split).map((r) => `R6 ${r}`));
+  const qd = instantNs(q.quoteRequest.deadline);
+  if (qd === null) unavailable.push("R4 the provider's deadline is not an ISO 8601 instant");
+  else if (qd !== instantNs(i.deposit.deadline)) request.push("R4 deadline differs");
+  const inactive = instantNs(q.quote.deadline);
+  if (inactive === null) unavailable.push("R4 the provider's deposit-address deadline is missing or unreadable");
+  else if (qd !== null && inactive < qd) pipeline.push("R4 deposit address goes inactive before the deadline");
+  if (!i.treasury) unavailable.push("R6 no treasury configured for this mode");
+  else pipeline.push(...appFeesFailures(q.quoteRequest.appFees, i.treasury, i.split).map((r) => `R6 ${r}`));
   const match = matchRegistry(i.registry, {
     recipient: q.quoteRequest.recipient,
     recipientType: q.quoteRequest.recipientType,
     destinationAsset: q.quoteRequest.destinationAsset,
     livemode: i.livemode,
   });
-  if (!match.ok && match.class === "security") security.push(`R5 ${match.reason}`);
-  if (security.length) return { ok: false, class: "security", reasons: security };
+  const unknown = !match.ok && match.class === "security";
+  if (unknown && !i.recipientUnknownAs) pipeline.push(`R5 ${match.reason}`);
+  if (pipeline.length) {
+    const onlyR5 = unknown && pipeline.length === 1;
+    return {
+      ok: false,
+      class: "security",
+      evidence: "pipeline",
+      reasons: [...pipeline, ...request],
+      ...(onlyR5 ? { recipientUnknown: true as const } : {}),
+      ...(match.ok ? { row: match.row } : {}),
+    };
+  }
+  if (request.length)
+    return {
+      ok: false,
+      class: "security",
+      evidence: "request",
+      reasons: request,
+      ...(match.ok ? { row: match.row } : {}),
+    };
+  if (unavailable.length) return { ok: false, class: "unavailable", reasons: unavailable };
+  if (unknown && i.recipientUnknownAs)
+    return { ok: false, class: i.recipientUnknownAs.class, reasons: [`R5 ${i.recipientUnknownAs.reason}`] };
   if (!match.ok) return { ok: false, class: match.class, reasons: [`R5 ${match.reason}`] };
   if (!OPEN.has(i.status.status)) return { ok: false, class: "stale", reasons: [`R7 status ${i.status.status}`] };
-  if (qd <= i.nowMs + 60_000) return { ok: false, class: "stale", reasons: ["R7 deadline within 60 s"] };
+  if ((qd as bigint) <= BigInt(i.nowMs + 60_000) * 1_000_000n)
+    return { ok: false, class: "stale", reasons: ["R7 deadline within 60 s"] };
   return { ok: true, row: match.row };
 }
 
@@ -191,8 +330,10 @@ export function checkIntents(i: {
   nowMs: number;
 }): { ok: true; row: RegistryRow } | ({ ok: false } & CheckFailure) {
   const r = i.requirement;
+  // every field of the requirement comes from the caller: a refusal is `request` evidence (ADR-0028)
   const security: string[] = [];
-  if (!i.treasury || r.fee_to !== i.treasury) security.push("fee recipient is not the treasury");
+  if (!i.treasury) return { ok: false, class: "unavailable", reasons: ["no treasury configured for this mode"] };
+  if (r.fee_to !== i.treasury) security.push("fee recipient is not the treasury");
   const amount = /^\d+$/.test(r.amount) ? BigInt(r.amount) : -1n;
   const fee = /^\d+$/.test(r.fee_amount) ? BigInt(r.fee_amount) : -1n;
   if (amount <= 0n) security.push("amount is not positive");
@@ -205,9 +346,10 @@ export function checkIntents(i: {
     livemode: i.livemode,
   });
   if (!match.ok && match.class === "security") security.push(match.reason);
-  if (security.length) return { ok: false, class: "security", reasons: security };
+  if (security.length) return { ok: false, class: "security", evidence: "request", reasons: security };
   if (!match.ok) return { ok: false, class: match.class, reasons: [match.reason] };
-  if (Date.parse(r.deadline) <= i.nowMs + 30_000)
+  const deadline = instantNs(r.deadline);
+  if (deadline === null || deadline <= BigInt(i.nowMs + 30_000) * 1_000_000n)
     return { ok: false, class: "stale", reasons: ["deadline within 30 s"] };
   return { ok: true, row: match.row };
 }

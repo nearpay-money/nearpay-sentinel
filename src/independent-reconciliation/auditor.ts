@@ -403,8 +403,9 @@ async function existing(s: Sentinel, executionId: string): Promise<Set<CheckKind
     .selectFrom("audit_findings")
     .select("check_kind")
     .where("execution_id", "=", executionId)
+    .where("check_kind", "in", ["destination", "settlement"])
     .execute();
-  return new Set(rows.map((r) => r.check_kind));
+  return new Set(rows.map((r) => r.check_kind as CheckKind));
 }
 
 /** Records one finding (once per execution and check) and emits it when it is not a pass. */
