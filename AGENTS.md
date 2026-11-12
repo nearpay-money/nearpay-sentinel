@@ -1,6 +1,6 @@
 # AGENTS.md — nearpay-sentinel
 
-You are working in **nearpay-sentinel**, one of 27 NearPay repositories (`nearpay-brain/architecture/repositories.md`).
+You are working in **nearpay-sentinel**, one of 26 NearPay repositories (`nearpay-brain/architecture/repositories.md`).
 Scope: Independent second party with its own code, credentials and deploy pipeline: co-signs every deposit instruction shown by checkout after re-reading the quote from 1Click and matching it to an active destination in identity's registry; independently re-reconciles succeeded payments against chain evidence; owns the global quoting kill switch.
 
 ## Before changing anything
