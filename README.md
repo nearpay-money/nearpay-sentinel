@@ -1,6 +1,12 @@
 # nearpay-sentinel
 
-> Independent second party with its own code, credentials and deploy pipeline: co-signs every deposit instruction shown by checkout after re-reading the quote from 1Click and matching it to an active destination in identity's registry; independently re-reconciles succeeded payments against chain evidence; owns the global quoting kill switch.
+Independent second party with its own code and credentials: it co-signs every deposit instruction that checkout shows, after re-reading the quote from 1Click and matching it to an active payout wallet in identity's registry; it re-checks settled payments against chain evidence; and it owns the kill switch and the per-merchant quarantine.
+
+Part of [NearPay](https://github.com/nearpay-money/nearpay) — start there for the live demo, the architecture diagram and the full "do X, see Y" walkthrough.
+
+- **Where it sits:** checkout calls `POST /v1/attestations/deposit_instructions` through the gateway and refuses to show a deposit address without sentinel's signature; the ops console calls `/ops/kill_switch…`; payments, rails and agentpay follow its kill-switch events. It reads 1Click and the chains with its own credentials, identity's destination registry read-only, rails (was this address issued by NearPay?) and, in test mode, sandbox.
+- **Containment rule (ADR-0028):** an integrity failure on one payment is contained to that merchant (quarantine, 30 minutes by default). The global kill switch engages automatically only on corroborated evidence across merchants, and an automatic stop that the current rules would not engage is released by sentinel itself.
+- **Status:** NearPay runs on NEAR mainnet as a closed beta (https://nearpay.money). This service is part of that deployment.
 
 |                                       |                                                                                                           |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------- |
@@ -13,15 +19,16 @@
 
 ## Documentation
 
-This repo stays surgical: design docs live in [`nearpay-brain`](../nearpay-brain/README.md), not here.
+Design docs live in [`nearpay-brain`](https://github.com/nearpay-money/nearpay-brain), not here.
 
-- `nearpay-brain/lld/sentinel.md` — **low-level design (dev-ready; implement from this)**
-- `nearpay-brain/lld/audits/sentinel.md` — audit findings already folded into the LLD
-- `nearpay-brain/roadmap/development-plan.md` — stage and step this repo is built in
-- `nearpay-brain/architecture/hld.md` — system design
-- `nearpay-brain/architecture/repositories.md` — repo topology and dependency rules
-- `nearpay-brain/architecture/security.md`
-- `nearpay-brain/decisions/ADR-0012-independent-verification.md`
+- [`lld/sentinel.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/lld/sentinel.md) — low-level design this repo is implemented from
+- [`lld/audits/sentinel.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/lld/audits/sentinel.md) — audit findings already folded into the LLD
+- [`roadmap/development-plan.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/roadmap/development-plan.md) — stage and step this repo is built in
+- [`architecture/hld.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/architecture/hld.md) — system design
+- [`architecture/repositories.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/architecture/repositories.md) — repo topology and dependency rules
+- [`architecture/security.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/architecture/security.md)
+- [`decisions/ADR-0012-independent-verification.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/decisions/ADR-0012-independent-verification.md)
+- [`decisions/ADR-0028-scoped-integrity-containment.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/decisions/ADR-0028-scoped-integrity-containment.md)
 
 ## Layout
 
@@ -51,15 +58,26 @@ nearpay-sentinel/
 └── Dockerfile                        distroless Node 22 image, `node dist/main.js <process>`
 ```
 
+## Verify this repo
+
+Needs Node 22 (`.nvmrc`) and pnpm 9. `.npmrc` points the `@nearpay-money` and `@nearpay-internal` scopes at a local package registry, so start that first.
+
+1. Start the local registry (no Docker, Node 22 only):
+   `git clone https://github.com/nearpay-money/nearpay-deploy ../nearpay-deploy && ../nearpay-deploy/scripts/registry.sh start`
+   → `curl http://127.0.0.1:4873/-/ping` answers `{}`.
+2. `pnpm install --frozen-lockfile` → ends with `Done in …`, no registry errors.
+3. `pnpm test` (unit and property tests of the co-signing rules R1–R7, containment, the kill switch and the audit reads; no Docker) → `Test Files  22 passed (22)`, `Tests  361 passed (361)`.
+4. `pnpm verify` (the full gate: typecheck, lint, unit tests with the coverage gate of ≥ 90 % branches on the pure rules, integration tests, build) → exits 0. The integration step needs a running Docker daemon: Testcontainers starts Postgres, NATS, Valkey, Anvil and the `nearpay/sandbox:local` image, which you build first in a [nearpay-sandbox](https://github.com/nearpay-money/nearpay-sandbox) checkout (its README has the `docker build` line). Steps 1–3 need none of that.
+
 ## Commands
 
-| Command                                                                                                     | What it does                                                                                                                                                        |
-| ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pnpm install`                                                                                              | Install (Node 22, pnpm 9); `@nearpay-money/*` and `@nearpay-internal/*` come from the local registry (`.npmrc`, `nearpay-deploy/scripts/up.sh` starts it)           |
-| `pnpm test`                                                                                                 | Unit and property tests                                                                                                                                             |
-| `pnpm test:integration`                                                                                     | Integration and contract tests: Postgres, NATS, Valkey, Anvil and the `nearpay/sandbox:local` image in Testcontainers (needs Docker; build the sandbox image first) |
-| `pnpm verify`                                                                                               | typecheck + lint + unit tests with the coverage gate (≥ 90 % branches on the pure rules) + integration tests + build                                                |
-| `docker build --network host --build-arg NP_REGISTRY_URL=http://127.0.0.1:4873 -t nearpay/sentinel:local .` | Image (what `up.sh` runs)                                                                                                                                           |
+| Command | What it does |
+| --- | --- |
+| `pnpm install --frozen-lockfile` | Install; NearPay packages come from the local registry (see "Verify this repo") |
+| `pnpm test` | Unit and property tests |
+| `pnpm test:integration` | Integration and contract tests: Postgres, NATS, Valkey, Anvil and the `nearpay/sandbox:local` image in Testcontainers (needs Docker; build the sandbox image first) |
+| `pnpm verify` | typecheck + lint + unit tests with the coverage gate (≥ 90 % branches on the pure rules) + integration tests + build |
+| `docker build --network host --build-arg NP_REGISTRY_URL=http://127.0.0.1:4873 -t nearpay/sentinel:local .` | Image (what nearpay-deploy's `scripts/up.sh` runs) |
 
 ## Configuration
 
@@ -90,7 +108,7 @@ nearpay-sentinel/
 - **Kill switch:** one versioned row; every change appends `kill_switch_log` (append-only) and emits `evt.sentinel.kill_switch.engaged|released` in the same transaction. Console (`/ops/kill_switch…`): engage by one operator without step-up; release only by a request (step-up, expires after 1 h, one pending) approved by a **different** `ops_admin` with a fresh step-up (`approver_conflict` otherwise; repeated by a DB check). `POST /internal/kill-switch` and the ops CLI keep engage; their single-person release works only when `NP_ENV` is `local` or `test` and answers `409 two_person_required` on any other value (`server`, unknown, empty). Every console write emits `evt.sentinel.ops_action.recorded`.
 - **Refund legs** (`kind: refund`) are audited too: the `destination` finding checks the refund source (`origin.refund_to`), the `settlement` finding the delivery to the payer.
 
-## Ops CLI (Stage 1)
+## Ops CLI
 
 ```sh
 docker compose -p nearpay exec sentinel-api /nodejs/bin/node dist/ops.js kill-switch
@@ -102,6 +120,13 @@ docker compose -p nearpay exec sentinel-api /nodejs/bin/node dist/ops.js kill-sw
 
 Stage 2 (step 2.2) implemented against `@nearpay-money/spec` / `@nearpay-internal/spec` 0.2.0 and kit 0.2.0: console routes (kill switch, two-person release, log, findings), operator-action events, attested origin asset (CR-15-07), refund-leg audit; the Stage 1 1Click body normalisation is gone (spec transcribes the live shape).
 
+Since then: Solana and Bitcoin coverage (stage 4.2: SPL reconciliation, own settlement reads), scoped integrity containment with drift classification and automatic release of stale automatic stops (ADR-0028), asset ids in the 1Click `.omft.near`, `.omdep.near` and `1cs_v1:` shapes, and kit 0.6.0 (`dead-letters` and `outbox` ops commands). Current pins (`package.json`): `@nearpay-money/spec` 0.5.2, kit packages 0.6.0.
+
 ## Built with
 
-TypeScript 5, Node 22, `@nearpay-internal/*` kit (service, db, bus, http, auth, chains, intents, ids), `@defuse-protocol/one-click-sdk-typescript` (quote signatures), `canonicalize` (RFC 8785), `ioredis` (Valkey cache), `bs58`, Kysely + pg, NATS JetStream; tests with Vitest, fast-check, Testcontainers, Anvil (Foundry) and `@noble/curves`. Code and documentation are written with AI assistance (Claude) under human direction and review.
+- Runtime: TypeScript 5 on Node 22; `@nearpay-internal/*` kit (service, db, bus, http, auth, chains, intents, money, ids) with Kysely + pg and NATS JetStream underneath; `@defuse-protocol/one-click-sdk-typescript` (quote signatures), `canonicalize` (RFC 8785), `@noble/hashes`, `@scure/base`, `@scure/btc-signer`, `bs58`, `ioredis` (Valkey cache), `prom-client`, `zod`.
+- External services: NEAR Intents 1Click, NEAR RPC, EVM and Solana RPCs, Bitcoin Esplora — read with sentinel's own credentials.
+- Tests and tooling: Vitest, fast-check, Testcontainers, Anvil (Foundry), `@noble/curves`, Biome.
+- Licence: Apache-2.0 (`LICENSE`).
+
+Code and documentation are written with AI assistance (Claude) under human direction and review. Built for the NEAR Hackathon (Nov 2026).
