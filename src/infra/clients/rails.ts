@@ -1,7 +1,7 @@
 /**
  * Rails' internal API with sentinel's service credentials (scope `rails.read`). Used for two
- * non-verdict questions only (lld/sentinel.md §5, §7): did NearPay issue a deposit address (the kill
- * switch decision after a security refusal), and an asset's decimals and price (audit sampling).
+ * non-verdict questions only (lld/sentinel.md §5, §7): did NearPay issue a deposit address, and for which
+ * execution and account (containment of a security refusal, ADR-0028), and an asset's decimals and price (audit sampling).
  */
 import { httpClient } from "@nearpay-internal/http";
 import { getInternalAsset, lookupExecutionByDeposit } from "@nearpay-internal/spec";
@@ -27,7 +27,7 @@ export function railsClient(o: {
         const r = await client.call(lookupExecutionByDeposit, {
           query: { deposit_address: address, ...(memo ? { memo } : {}) },
         });
-        return { exists: r.exists, livemode: r.livemode };
+        return { exists: r.exists, livemode: r.livemode, execution_id: r.execution_id, account_id: r.account_id };
       } catch {
         return null;
       }

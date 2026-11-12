@@ -1,4 +1,4 @@
-/** Kysely table types (migrations/0001_sentinel.sql, 0002_two_person_release.sql, 0003_account_names.sql, 0004_single_operator.sql) and identity's registry view (read-only role). */
+/** Kysely table types (migrations/0001_sentinel.sql, 0002_two_person_release.sql, 0003_account_names.sql, 0004_single_operator.sql, 0005_integrity_containment.sql) and identity's registry view (read-only role). */
 import type { ColumnType, KitTables } from "@nearpay-internal/db";
 
 type Timestamp = ColumnType<Date, Date | string | undefined, Date | string>;
@@ -28,7 +28,8 @@ export interface AuditFindingsTable {
   execution_id: string;
   account_id: string;
   livemode: boolean;
-  check_kind: "destination" | "settlement";
+  /** `attestation` (migration 0005): a pipeline integrity breach on a live NearPay deposit address. */
+  check_kind: "destination" | "settlement" | "attestation";
   result: "pass" | "mismatch" | "unverifiable";
   details: Json<Record<string, unknown>>;
   tx_chain: Opt<string>;
@@ -89,8 +90,59 @@ export interface AccountNamesTable {
   updated_at: Timestamp;
 }
 
+/** A `security` refusal on a deposit address rails confirmed NearPay issued (migration 0005, append-only). */
+export interface IntegrityBreachesTable {
+  id: string;
+  livemode: boolean;
+  evidence: "pipeline" | "request";
+  rules: ColumnType<string[], string[], string[]>;
+  reasons: ColumnType<string[], string[], string[]>;
+  attempt_id: string;
+  deposit_address: Opt<string>;
+  deposit_memo: Opt<string>;
+  execution_id: Opt<string>;
+  account_id: Opt<string>;
+  destination_account_id: Opt<string>;
+  client_ip: Opt<string>;
+  quarantined: ColumnType<boolean, boolean | undefined, boolean>;
+  systemic: ColumnType<boolean, boolean | undefined, boolean>;
+  created_at: Timestamp;
+}
+
+/** One quarantine per (account, mode) (migration 0005). */
+export interface QuarantinesTable {
+  account_id: string;
+  livemode: boolean;
+  status: "active" | "cleared";
+  reason: string;
+  breach_id: Opt<string>;
+  created_by: string;
+  created_at: Timestamp;
+  expires_at: ColumnType<Date, Date | string, Date | string>;
+  cleared_at: Opt<Date>;
+  cleared_by: Opt<string>;
+  clear_note: Opt<string>;
+  version: ColumnType<number, number | undefined, number>;
+  updated_at: Timestamp;
+}
+
+export interface QuarantineLogTable {
+  id: string;
+  account_id: string;
+  livemode: boolean;
+  action: "quarantined" | "extended" | "cleared";
+  reason: string;
+  actor: string;
+  expires_at: Opt<Date>;
+  version: number;
+  created_at: Timestamp;
+}
+
 export interface SentinelTables {
   account_names: AccountNamesTable;
+  integrity_breaches: IntegrityBreachesTable;
+  quarantines: QuarantinesTable;
+  quarantine_log: QuarantineLogTable;
   attestations: AttestationsTable;
   audit_findings: AuditFindingsTable;
   kill_switch: KillSwitchTable;

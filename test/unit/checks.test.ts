@@ -7,11 +7,14 @@ import { describe, expect, it } from "vitest";
 import { assetChain, assetShape } from "../../src/address-integrity/assets.js";
 import {
   appFeesFailures,
+  baseUnits,
   checkIntents,
   checkRouteQuote,
+  instantNs,
   matchRegistry,
   type RegistryRow,
   type RouteQuoteInput,
+  recipientIsListed,
 } from "../../src/address-integrity/checks.js";
 import { oneClickStatus } from "../../src/infra/clients/providers.js";
 import { fixture } from "../support/keys.js";
@@ -136,7 +139,6 @@ describe("route_quote checks", () => {
       { q: quote((q) => (q.quote.deadline = "2026-11-05T18:00:00.000Z")) },
       /R4 deposit address goes inactive/,
     ],
-    ["R4 no address deadline", { q: quote((q) => delete q.quote.deadline) }, /R4 deposit address goes inactive/],
     [
       "R5 unknown recipient",
       { registry: [row({ address_norm: "0x1111111111111111111111111111111111111111" })] },
@@ -151,7 +153,6 @@ describe("route_quote checks", () => {
       { q: quote((q) => (q.quoteRequest.appFees = [{ recipient: "attacker.near", fee: 50 }])) },
       /^R6 /,
     ],
-    ["R6 no treasury configured", { treasury: null }, /^R6 no treasury/],
   ];
   it.each(security)("%s → security", (_n, o, reason) => {
     const r = checkRouteQuote(input(o));
@@ -394,8 +395,8 @@ describe("intents_transfer checks", () => {
     expect(checkIntents({ ...base, requirement: { ...req, amount: "1999999", fee_amount: "100000" } }).ok).toBe(true);
     expect(checkIntents({ ...base, requirement: { ...req, amount: "1999999", fee_amount: "100001" } }).ok).toBe(false);
   });
-  it("no treasury configured → security", () => {
-    expect(checkIntents({ ...base, treasury: null })).toMatchObject({ ok: false, class: "security" });
+  it("no treasury configured → unavailable (configuration, ADR-0028), never security", () => {
+    expect(checkIntents({ ...base, treasury: null })).toMatchObject({ ok: false, class: "unavailable" });
   });
   it("ambiguous registry → ambiguous", () => {
     const rows = [
@@ -445,5 +446,186 @@ describe("asset ids", () => {
     expect(assetChain(USDC_NEAR)).toBe("near:mainnet");
     expect(assetChain("nep245:x")).toBeNull();
     expect(assetChain("nep141:zzz.omft.near")).toBeNull();
+  });
+});
+
+describe("classification (ADR-0028): evidence, canonical comparisons, configuration and provider shape", () => {
+  const withDeposit = (patch: Partial<RouteQuoteInput["deposit"]>, o: Parameters<typeof input>[0] = {}) => {
+    const i = input(o);
+    return checkRouteQuote({ ...i, deposit: { ...i.deposit, ...patch } });
+  };
+
+  it.each([
+    ["R2 signature", { signatureValid: false }],
+    ["R3 referral", { q: quote((q) => (q.quoteRequest.referral = "someone")) }],
+    ["R4 address", { q: quote((q) => (q.quote.depositAddress = "0x0000000000000000000000000000000000000bad")) }],
+    ["R4 memo", { q: quote((q) => (q.quote.depositMemo = "123")) }],
+    ["R4 address inactive early", { q: quote((q) => (q.quote.deadline = "2026-11-05T18:00:00.000Z")) }],
+    ["R5 unknown recipient", { registry: [] }],
+    ["R6 attacker fee", { q: quote((q) => (q.quoteRequest.appFees = [{ recipient: "attacker.near", fee: 50 }])) }],
+  ] as [string, Parameters<typeof input>[0]][])("%s is pipeline evidence (not producible by a payer)", (_n, o) => {
+    expect(checkRouteQuote(input(o))).toMatchObject({ ok: false, class: "security", evidence: "pipeline" });
+  });
+
+  it.each([
+    ["origin asset", { origin_asset_id: USDC_NEAR }],
+    ["amount", { amount_in: "1" }],
+    ["chain", { chain: "eip155:1" }],
+    ["deadline", { deadline: "2026-11-05T18:26:54.000Z" }],
+    ["unreadable request deadline", { deadline: "tomorrow" }],
+    ["unreadable request amount", { amount_in: "1e6" }],
+  ] as [string, Partial<RouteQuoteInput["deposit"]>][])(
+    "a caller-supplied %s mismatch is request evidence (refused, never contained)",
+    (_n, patch) => {
+      const r = withDeposit(patch);
+      expect(r).toMatchObject({ ok: false, class: "security", evidence: "request" });
+      // the matched destination is reported, so the record names the account
+      if (!r.ok) expect(r.row).toEqual(row());
+    },
+  );
+
+  it("pipeline evidence outranks request evidence and carries both reasons", () => {
+    const r = withDeposit({ amount_in: "1" }, { signatureValid: false });
+    expect(r).toMatchObject({ ok: false, class: "security", evidence: "pipeline" });
+    if (!r.ok) expect(r.reasons).toEqual(["R2 provider signature does not verify", "R4 amount differs"]);
+  });
+
+  it("R5 unknown recipient alone is flagged for the registry re-read; not when other pipeline reasons exist", () => {
+    expect(checkRouteQuote(input({ registry: [] }))).toMatchObject({ recipientUnknown: true });
+    const both = checkRouteQuote(input({ registry: [], signatureValid: false }));
+    expect(both).toMatchObject({ class: "security", evidence: "pipeline" });
+    expect(both).not.toHaveProperty("recipientUnknown");
+  });
+
+  it("R5 re-read verdicts: stale / unavailable replace security, but never outrank another breach", () => {
+    expect(checkRouteQuote(input({ registry: [], recipientUnknownAs: { class: "stale", reason: "lag" } }))).toEqual({
+      ok: false,
+      class: "stale",
+      reasons: ["R5 lag"],
+    });
+    expect(
+      checkRouteQuote(input({ registry: [], recipientUnknownAs: { class: "unavailable", reason: "behind" } })),
+    ).toEqual({ ok: false, class: "unavailable", reasons: ["R5 behind"] });
+    expect(
+      checkRouteQuote(
+        input({ registry: [], signatureValid: false, recipientUnknownAs: { class: "stale", reason: "x" } }),
+      ),
+    ).toMatchObject({ class: "security", evidence: "pipeline", reasons: ["R2 provider signature does not verify"] });
+    // a re-read verdict does not apply when the recipient matched
+    expect(checkRouteQuote(input({ recipientUnknownAs: { class: "stale", reason: "x" } }))).toEqual({
+      ok: true,
+      row: row(),
+    });
+  });
+
+  it("R6 no treasury configured and unreadable provider values are unavailable, not security", () => {
+    expect(checkRouteQuote(input({ treasury: null }))).toEqual({
+      ok: false,
+      class: "unavailable",
+      reasons: ["R6 no treasury configured for this mode"],
+    });
+    expect(checkRouteQuote(input({ q: quote((q) => delete q.quote.deadline) }))).toMatchObject({
+      class: "unavailable",
+      reasons: ["R4 the provider's deposit-address deadline is missing or unreadable"],
+    });
+    expect(
+      checkRouteQuote(input({ q: quote((q) => (q.quoteRequest.deadline = "2026-11-05 18:26:53")) })),
+    ).toMatchObject({
+      class: "unavailable",
+      reasons: ["R4 the provider's deadline is not an ISO 8601 instant"],
+    });
+    expect(checkRouteQuote(input({ q: quote((q) => (q.quote.amountIn = "2.5")) }))).toMatchObject({
+      class: "unavailable",
+      reasons: ["R4 the provider's amountIn is not a base-unit integer"],
+    });
+    // a genuine breach still wins over an unreadable value
+    expect(checkRouteQuote(input({ treasury: null, signatureValid: false }))).toMatchObject({ class: "security" });
+    // request evidence also outranks configuration
+    expect(withDeposit({ amount_in: "1" }, { treasury: null })).toMatchObject({
+      class: "security",
+      evidence: "request",
+    });
+  });
+
+  it("compares meanings, not strings: deadline forms, memo null/empty, integral amount tails, EVM address case", () => {
+    for (const deadline of [
+      "2026-11-05T18:26:53Z",
+      "2026-11-05T18:26:53.000000Z",
+      "2026-11-05T20:26:53+02:00",
+      "2026-11-05T18:26:53.000+0000",
+    ])
+      expect(withDeposit({ deadline }).ok).toBe(true);
+    expect(withDeposit({ deadline: "2026-11-05T18:26:53.001Z" })).toMatchObject({ evidence: "request" });
+    expect(checkRouteQuote(input({ q: quote((q) => (q.quote.depositMemo = "")) })).ok).toBe(true);
+    expect(withDeposit({ memo: "" }).ok).toBe(true);
+    expect(withDeposit({ memo: "7" })).toMatchObject({ class: "security", evidence: "pipeline" });
+    const amount = recorded().quote.amountIn;
+    expect(withDeposit({ amount_in: `${amount}.000` }).ok).toBe(true);
+    expect(withDeposit({ amount_in: `0${amount}` }).ok).toBe(true);
+    expect(withDeposit({ amount_in: (BigInt(amount) + 1n).toString() })).toMatchObject({ evidence: "request" });
+    expect(withDeposit({ address: DEPOSIT.toUpperCase().replace("0X", "0x") }).ok).toBe(true);
+  });
+
+  it("instantNs: explicit offsets only, full fraction precision, calendar-valid", () => {
+    expect(instantNs("2026-11-05T18:26:53Z")).toBe(BigInt(Date.parse("2026-11-05T18:26:53Z")) * 1_000_000n);
+    expect(instantNs("2026-11-05T18:26:53.123456789z")).toBe(
+      BigInt(Date.parse("2026-11-05T18:26:53Z")) * 1_000_000n + 123_456_789n,
+    );
+    expect(instantNs("2026-11-05T13:26:53-05:00")).toBe(instantNs("2026-11-05T18:26:53Z"));
+    for (const bad of [
+      "2026-11-05T18:26:53",
+      "2026-02-30T00:00:00Z",
+      "2026-13-01T00:00:00Z",
+      "2026-11-05T24:00:00Z",
+      "2026-11-05T18:60:00Z",
+      "2026-11-05T18:26:60Z",
+      "2026-11-05T18:26:53+24:00",
+      "2026-11-05T18:26:53+01:60",
+      "2026-00-05T18:26:53Z",
+      "2026-11-00T18:26:53Z",
+      "Thu, 05 Nov 2026 18:26:53 GMT",
+      "",
+      42,
+      null,
+    ])
+      expect(instantNs(bad)).toBeNull();
+  });
+
+  it("baseUnits", () => {
+    expect(baseUnits("2014321")).toBe(2014321n);
+    expect(baseUnits("10.00")).toBe(10n);
+    for (const bad of ["1.5", "-1", "1e6", " 1", "", "0x10", 5, null]) expect(baseUnits(bad)).toBeNull();
+  });
+
+  it("recipientIsListed: any asset/type/mode, normal forms, never throws", () => {
+    const evm = row({
+      type: "chain_address",
+      chain: "eip155:8453",
+      address_norm: "0x52908400098527886e0f7030069857d2e4169ee7",
+      asset_id: USDC_BASE,
+    });
+    expect(recipientIsListed([evm], "0x52908400098527886E0F7030069857D2E4169EE7")).toBe(true);
+    expect(recipientIsListed([row()], RECIPIENT.toUpperCase().replace("0X", "0x"))).toBe(true);
+    expect(recipientIsListed([evm, row()], "attacker.near")).toBe(false);
+    expect(recipientIsListed([evm], "not an address")).toBe(false);
+  });
+
+  it("intents: every refusal is request evidence; an unreadable deadline is stale", () => {
+    const d = Date.parse("2026-11-05T19:00:00Z");
+    const req = {
+      pay_to: RECIPIENT,
+      token: USDC_NEAR,
+      amount: "1000000",
+      fee_to: TREASURY,
+      fee_amount: "5000",
+      binding: `np1:${"1".repeat(43)}`,
+      deadline: new Date(d).toISOString(),
+    };
+    const i = { livemode: true, requirement: req, registry: [row()], treasury: TREASURY, nowMs: NOW };
+    expect(checkIntents({ ...i, requirement: { ...req, fee_to: "x.near" } })).toMatchObject({
+      class: "security",
+      evidence: "request",
+    });
+    expect(checkIntents({ ...i, requirement: { ...req, deadline: "soon" } })).toMatchObject({ class: "stale" });
   });
 });

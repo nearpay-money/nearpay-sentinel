@@ -10,7 +10,18 @@ import { sql } from "@nearpay-internal/db";
 import { fromUuid, isId, toUuid } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import type { Sentinel } from "../app/context.js";
+import { changeQuarantine, listBreaches, listQuarantines, QuarantineNotFound } from "../kill-switch/containment.js";
 import { killSwitchState, setKillSwitch, setKillSwitchSinglePerson } from "../kill-switch/kill-switch.js";
+
+async function quarantineChange(s: Sentinel, o: Parameters<typeof changeQuarantine>[1]) {
+  try {
+    return await changeQuarantine(s, o);
+  } catch (e) {
+    if (e instanceof QuarantineNotFound)
+      throw new ApiError("state_conflict", { message: "The account has no quarantine in force in that mode." });
+    throw e;
+  }
+}
 
 export const USAGE = `usage: ops.js <command> [arguments]
 
@@ -19,7 +30,15 @@ export const USAGE = `usage: ops.js <command> [arguments]
   kill-switch-release <reason…>             resume live quoting (one operator; local/test stacks only)
   findings [--all] [--limit N]              open (unacknowledged, non-pass) audit findings; --all: every finding
   finding-ack <fnd_…> <note…>               acknowledge a finding
-  attestations <pa_… | deposit key | deposit address> [--limit N]   co-signing records, newest first`;
+  attestations <pa_… | deposit key | deposit address> [--limit N]   co-signing records, newest first
+  integrity-breaches [--limit N]            security refusals on NearPay deposit addresses, newest first
+  quarantines [--all]                       accounts sentinel does not sign for right now; --all: every quarantine
+  quarantine-clear <acct_…> <note…> [--test]          sign for the account again now
+  quarantine-extend <acct_…> <minutes> <note…> [--test]  hold (or re-hold) the account for <minutes> from now
+
+  A breach on one payment quarantines that account only (ADR-0028); quarantines expire on their own
+  (NP_QUARANTINE_TTL_S). The kill switch is engaged by sentinel only on corroborated breaches across accounts
+  and is released in the console (two-person / single-operator release).`;
 
 class UsageError extends Error {}
 
@@ -37,10 +56,16 @@ export async function runOps(argv: readonly string[], s: Sentinel, deps: OpsDeps
       args: [...argv],
       allowPositionals: true,
       strict: true,
-      options: { all: { type: "boolean" }, limit: { type: "string" } },
+      options: { all: { type: "boolean" }, limit: { type: "string" }, test: { type: "boolean" } },
     });
     const [cmd, ...args] = positionals;
-    const result = await run(s, cmd, args, { all: values.all ?? false, limit: values.limit }, deps.actor);
+    const result = await run(
+      s,
+      cmd,
+      args,
+      { all: values.all ?? false, limit: values.limit, test: values.test ?? false },
+      deps.actor,
+    );
     out(JSON.stringify(result, (_k, v) => (typeof v === "bigint" ? v.toString() : v), 2));
     return 0;
   } catch (e) {
@@ -102,7 +127,7 @@ async function run(
   s: Sentinel,
   cmd: string | undefined,
   args: string[],
-  o: { all: boolean; limit: string | undefined },
+  o: { all: boolean; limit: string | undefined; test: boolean },
   actor: string,
 ): Promise<unknown> {
   switch (cmd) {
@@ -173,6 +198,23 @@ async function run(
       else if (ref.includes("|") || ref.startsWith("np1:")) q = q.where("deposit_key", "=", ref);
       else q = q.where(sql<string>`split_part(deposit_key, '|', 2)`, "=", ref);
       return q.execute();
+    }
+    case "integrity-breaches":
+      return listBreaches(s, limitOf(o.limit));
+    case "quarantines":
+      return listQuarantines(s, o.all);
+    case "quarantine-clear": {
+      const [ref, ...note] = args;
+      if (!ref || !isId("acct", ref)) throw new UsageError("quarantine-clear needs an acct_… id");
+      return quarantineChange(s, { account: ref, livemode: !o.test, minutes: null, note: reasonOf(note), actor });
+    }
+    case "quarantine-extend": {
+      const [ref, minutes, ...note] = args;
+      if (!ref || !isId("acct", ref)) throw new UsageError("quarantine-extend needs an acct_… id");
+      const m = Number(minutes);
+      if (!Number.isInteger(m) || m < 1 || m > 10_080)
+        throw new UsageError("minutes must be an integer from 1 to 10080");
+      return quarantineChange(s, { account: ref, livemode: !o.test, minutes: m, note: reasonOf(note), actor });
     }
     default:
       throw new UsageError(cmd ? `unknown command ${cmd}` : "missing command");
