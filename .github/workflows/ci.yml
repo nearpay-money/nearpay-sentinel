@@ -14,6 +14,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
+      # Without the repository variable NP_REGISTRY_URL the job starts the local package registry on the runner
+      # (127.0.0.1:4873, where .npmrc points): Verdaccio seeded with the exact tarballs the lockfile pins
+      # (nearpay-deploy: scripts/registry.sh, registry-seed/). It needs Node.js, so it runs after setup-node.
+      - name: Start the local package registry
+        if: ${{ vars.NP_REGISTRY_URL == '' }}
+        uses: nearpay-money/nearpay-deploy/.github/actions/registry@main
       # @nearpay-money/* and @nearpay-internal/* come from a registry: the local Verdaccio in development,
       # GitHub Packages once remotes exist (repository variable NP_REGISTRY_URL + secret NP_REGISTRY_TOKEN).
       - name: Point the NearPay scopes at the CI registry
@@ -36,4 +42,4 @@ jobs:
       - run: pnpm verify
         env:
           NP_SANDBOX_IMAGE: ${{ vars.NP_SANDBOX_IMAGE || 'ghcr.io/nearpay-money/sandbox:latest' }}
-      - run: docker build --build-arg NP_REGISTRY_URL=${{ vars.NP_REGISTRY_URL || 'http://127.0.0.1:4873' }} -t nearpay/sentinel:ci .
+      - run: docker build --network host --build-arg NP_REGISTRY_URL=${{ vars.NP_REGISTRY_URL || 'http://127.0.0.1:4873' }} -t nearpay/sentinel:ci .
