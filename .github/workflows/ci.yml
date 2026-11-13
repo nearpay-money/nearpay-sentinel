@@ -36,10 +36,16 @@ jobs:
             echo "${host}:_authToken=${NP_REGISTRY_TOKEN}"
           } > .npmrc
       - run: pnpm install --frozen-lockfile
+      # The integration tests run against the nearpay-sandbox image. Without the repository variable NP_SANDBOX_IMAGE
+      # the job builds it from the public repository (the registry on the runner serves its packages).
+      - name: Build the sandbox image for the integration tests
+        if: ${{ vars.NP_SANDBOX_IMAGE == '' }}
+        run: |
+          git clone --depth 1 https://github.com/nearpay-money/nearpay-sandbox "$RUNNER_TEMP/nearpay-sandbox"
+          docker build --network host --build-arg NP_REGISTRY_URL=${{ vars.NP_REGISTRY_URL || 'http://127.0.0.1:4873' }} -t nearpay/sandbox:local "$RUNNER_TEMP/nearpay-sandbox"
       # Integration tests start Postgres, NATS, Valkey, Anvil and the nearpay-sandbox image with
-      # Testcontainers (Docker is on the runner); the sandbox image comes from the registry once images
-      # are published.
+      # Testcontainers (Docker is on the runner).
       - run: pnpm verify
         env:
-          NP_SANDBOX_IMAGE: ${{ vars.NP_SANDBOX_IMAGE || 'ghcr.io/nearpay-money/sandbox:latest' }}
+          NP_SANDBOX_IMAGE: ${{ vars.NP_SANDBOX_IMAGE || 'nearpay/sandbox:local' }}
       - run: docker build --network host --build-arg NP_REGISTRY_URL=${{ vars.NP_REGISTRY_URL || 'http://127.0.0.1:4873' }} -t nearpay/sentinel:ci .
